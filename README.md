@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# दुकान साथी AI (Dukaan Sathi AI)
+> **छोटे किराना दुकानदारों के लिए स्मार्ट डिजिटल मुनीम (Smart Digital Munim for Indian Kirana Stores)**
 
-## Getting Started
+Built with Next.js 16 (App Router), React 19, TypeScript, and Tailwind CSS.
 
-First, run the development server:
+---
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## 🌟 मुख्य विशेषताएं (Key Features)
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+1. **डैशबोर्ड (Dashboard)**
+   - **आज की बिक्री (Today's Sales):** आज का कुल बिक्री मूल्य और बिलों की संख्या।
+   - **कुल सामान (Total Products):** इन्वेंटरी में मौजूद आइटम्स की संख्या।
+   - **कम स्टॉक चेतावनी (Low-Stock Alert):** सीमा से कम स्टॉक वाले सामान का त्वरित अलर्ट और 1-क्लिक रीस्टॉक।
+   - **बाकी उधार (Pending Udhaar):** सभी ग्राहकों का कुल बकाया और देनदार ग्राहकों की संख्या।
+   - **हाल के लेन-देन (Recent Activities):** बिक्री, स्टॉक और उधार का ताजा टाइमलाइन।
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+2. **स्टॉक एवं इन्वेंटरी (Inventory Management)**
+   - सामान जोड़ें, संपादित करें, हटाएं (CRUD)।
+   - नाम, श्रेणी, इकाई (kg, gm, litre, packet, piece, bori), बिक्री मूल्य (₹), खरीद मूल्य, और कम स्टॉक सीमा।
+   - रियल-टाइम खोज और फ़िल्टरिंग (सभी, कम स्टॉक, आउट ऑफ स्टॉक, श्रेणी अनुसार)।
+   - त्वरित `+5` / `+10` स्टॉक जोड़ें बटन।
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+3. **नया बिल एवं बिक्री (Point of Sale & Billing)**
+   - फास्ट-टैप प्रोडक्ट कार्ड्स और सर्च।
+   - मात्रा चयन (फास्ट प्रेसेट्स: 0.5, 1, 2, 5)।
+   - **स्टॉक सुरक्षा:** स्टॉक से अधिक बिक्री की कोशिश पर तुरंत रोक।
+   - बिल कन्फर्म होते ही इन्वेंटरी से स्टॉक का ऑटो-डिडक्शन।
+   - भुगतान प्रकार: नकद (Cash), UPI/ऑनलाइन (QR), और उधार (सीधे ग्राहक खाते में दर्ज)।
+   - बिल रसीद पॉपअप और बिक्री इतिहास।
 
-## Learn More
+4. **उधार खाता (Udhaar Register)**
+   - नए ग्राहक जोड़ें (नाम, मोबाइल, पता, पुराना बकाया)।
+   - "उधार दिया (-)" और "जमा मिला (+)" का त्वरित हिसाब।
+   - ग्राहक-वार विस्तृत बही-खाता (Ledger Timeline)।
+   - **1-क्लिक व्हाट्सएप तगादा (WhatsApp Payment Reminder):** विनम्र हिंदी तगादा मैसेज जनरेटर और डायरेक्ट व्हाट्सएप लिंक।
 
-To learn more about Next.js, take a look at the following resources:
+5. **साथी AI (AI Assistant with Preview)**
+   - हिंग्लिश/हिंदी कमांड इनपुट (उदा. *"आज 3 किलो चीनी बिकी"*, *"रमेश ने 500 रुपये उधार लिए"*).
+   - माइक वॉइस इनपुट (Web Speech API) और सुझाए गए उदाहरण चिप्स।
+   - **पुष्टि पूर्वावलोकन (Confirmation Preview Card):** कोई भी लेन-देन सेव होने से पहले प्रभाव दिखाता है (स्टॉक या बकाया में कितना बदलाव होगा), जिसे कन्फर्म करने पर ही वास्तविक डेटाबेस/स्टोरेज में सेव किया जाता है।
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+---
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## 🛡️ प्रोटोटाइप एवं आर्किटेक्चर सूचना (Important Prototype Notes)
 
-## Deploy on Vercel
+- **लोकल स्टोरेज (Browser LocalStorage):** यह प्रोटोटाइप डेटा को सुरक्षित रूप से ब्राउज़र की लोकल स्टोरेज में रखता है (`lib/storage.ts`)।
+- **सुपाबेस रेडी (Supabase Architecture):** डेटा लेयर को क्लीन रिपॉजिटरी पैटर्न में अलग रखा गया है ताकि प्रोडक्शन में केवल `lib/storage.ts` के फंक्शन्स को Supabase PostgreSQL क्वेरीज़ से बदला जा सके।
+- **डेमो पार्सर:** AI असिस्टेंट वर्तमान में इन-ब्राउज़र स्मार्ट पार्सर (Rule-based NLP Engine) पर चलता है ताकि बिना किसी बाहरी API Key या सर्वर चार्ज के क्लाइंट साइड पर सुरक्षित रहे।
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+---
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## 🚀 चलाने का तरीका (How to Run)
+
+1. प्रोजेक्ट डायरेक्टरी में जाएं:
+   ```bash
+   cd dukaan-sathi
+   ```
+
+2. डिपेंडेंसीज इंस्टॉल करें (यदि पहले से नहीं हैं):
+   ```bash
+   npm install
+   ```
+
+3. डेवलपमेंट सर्वर शुरू करें:
+   ```bash
+   npm run dev
+   ```
+
+4. ब्राउज़र में खोलें:
+   ```
+   http://localhost:3000
+   ```
+
+5. प्रोडक्शन बिल्ड और लिंट टेस्ट:
+   ```bash
+   npm run build
+   npm run lint
+   ```
