@@ -1,3 +1,4 @@
+import { validateBackupRecords } from './validation.ts';
 import type {
   DukaanStoreData,
   DukaanShopBackup,
@@ -10,7 +11,7 @@ import type {
   ActivityLog,
   ShopProfile,
 } from '../types';
-import { getActiveProfile, saveStoreData, roundPrecision } from './storage.ts';
+import { getActiveProfile, saveStoreData, roundPrecision, preserveRecoverySnapshot, getStoreData } from './storage.ts';
 
 /**
  * Creates a clean, serialized JSON backup of the provided shop store data.
@@ -57,6 +58,10 @@ export function createShopBackup(storeData: DukaanStoreData): DukaanShopBackup {
     warranty: p.warranty?.trim() || undefined,
     batchNumber: p.batchNumber?.trim() || undefined,
     expiryDate: p.expiryDate?.trim() || undefined,
+    barcode: p.barcode?.trim() || undefined,
+    sku: p.sku?.trim() || undefined,
+    description: p.description?.trim() || undefined,
+    parentProductId: p.parentProductId?.trim() || undefined,
   }));
 
   // Clean customers array
@@ -66,6 +71,7 @@ export function createShopBackup(storeData: DukaanStoreData): DukaanShopBackup {
     phone: c.phone?.trim() || '—',
     address: c.address?.trim() || undefined,
     currentBalance: roundPrecision(Number(c.currentBalance || 0), 2),
+    advanceBalance: c.advanceBalance !== undefined ? roundPrecision(Math.max(0, Number(c.advanceBalance || 0)), 2) : 0,
     lastTransactionAt: c.lastTransactionAt || undefined,
     createdAt: c.createdAt || new Date().toISOString(),
   }));
@@ -74,6 +80,11 @@ export function createShopBackup(storeData: DukaanStoreData): DukaanShopBackup {
   const cleanSales: Sale[] = (storeData.sales || []).map((s) => ({
     id: s.id,
     invoiceNo: s.invoiceNo,
+    reversedAt: s.reversedAt,
+    reversalReason: s.reversalReason,
+    refundRecordedAt: s.refundRecordedAt,
+    operationId: s.operationId,
+    operationPayload: s.operationPayload,
     items: (s.items || []).map((item) => ({
       productId: item.productId,
       productName: item.productName,
@@ -81,8 +92,19 @@ export function createShopBackup(storeData: DukaanStoreData): DukaanShopBackup {
       quantity: roundPrecision(Number(item.quantity), 3),
       unitPrice: roundPrecision(Number(item.unitPrice), 2),
       totalPrice: roundPrecision(Number(item.totalPrice), 2),
+      barcode: item.barcode?.trim() || undefined,
+      sku: item.sku?.trim() || undefined,
+      size: item.size?.trim() || undefined,
+      color: item.color?.trim() || undefined,
+      brandOrVariant: item.brandOrVariant?.trim() || undefined,
     })),
     totalAmount: roundPrecision(Number(s.totalAmount), 2),
+    subtotal: s.subtotal !== undefined ? roundPrecision(Number(s.subtotal), 2) : undefined,
+    discountAmount: s.discountAmount !== undefined ? roundPrecision(Number(s.discountAmount), 2) : undefined,
+    discountType: s.discountType,
+    discountValue: s.discountValue !== undefined ? Number(s.discountValue) : undefined,
+    cashReceived: s.cashReceived !== undefined ? roundPrecision(Number(s.cashReceived), 2) : undefined,
+    changeDue: s.changeDue !== undefined ? roundPrecision(Number(s.changeDue), 2) : undefined,
     paymentMode: s.paymentMode,
     customerId: s.customerId || undefined,
     customerName: s.customerName || undefined,
@@ -90,6 +112,8 @@ export function createShopBackup(storeData: DukaanStoreData): DukaanShopBackup {
     notes: s.notes?.trim() || undefined,
     upiId: s.upiId?.trim() || undefined,
     paymentStatus: s.paymentStatus || 'completed',
+    paymentVerificationStatus: s.paymentVerificationStatus,
+    transactionRef: s.transactionRef?.trim() || undefined,
   }));
 
   // Clean udhaar transactions
@@ -282,6 +306,18 @@ export function validateShopBackup(raw: unknown): BackupValidationResult {
         };
       }
     }
+    if (prod.barcode !== undefined && prod.barcode !== null && typeof prod.barcode !== 'string') {
+      return {
+        isValid: false,
+        error: `Product "${prod.name}" has an invalid non-string barcode.`,
+      };
+    }
+    if (prod.sku !== undefined && prod.sku !== null && typeof prod.sku !== 'string') {
+      return {
+        isValid: false,
+        error: `Product "${prod.name}" has an invalid non-string SKU.`,
+      };
+    }
   }
 
   // Customers Validation
@@ -327,6 +363,14 @@ export function validateShopBackup(raw: unknown): BackupValidationResult {
         isValid: false,
         error: `Customer "${cust.name}" has an invalid non-numeric balance.`,
       };
+    }
+    if (cust.advanceBalance !== undefined) {
+      if (typeof cust.advanceBalance !== 'number' || isNaN(cust.advanceBalance) || cust.advanceBalance < 0) {
+        return {
+          isValid: false,
+          error: `Customer "${cust.name}" has an invalid advance balance.`,
+        };
+      }
     }
   }
 
@@ -382,6 +426,28 @@ export function validateShopBackup(raw: unknown): BackupValidationResult {
         error: `Sale "${String(sale.invoiceNo || sale.id)}" contains no billed items.`,
       };
     }
+
+    if (
+      sale.subtotal !== undefined &&
+      sale.subtotal !== null &&
+      (typeof sale.subtotal !== 'number' || isNaN(sale.subtotal) || sale.subtotal < 0)
+    ) {
+      return {
+        isValid: false,
+        error: `Sale "${String(sale.invoiceNo || sale.id)}" has an invalid subtotal.`,
+      };
+    }
+
+    if (
+      sale.discountAmount !== undefined &&
+      sale.discountAmount !== null &&
+      (typeof sale.discountAmount !== 'number' || isNaN(sale.discountAmount) || sale.discountAmount < 0)
+    ) {
+      return {
+        isValid: false,
+        error: `Sale "${String(sale.invoiceNo || sale.id)}" has an invalid discount amount.`,
+      };
+    }
   }
 
   // Udhaar Transactions Validation
@@ -416,7 +482,7 @@ export function validateShopBackup(raw: unknown): BackupValidationResult {
     }
     txIdSet.add(t.id);
 
-    if (!['credit_given', 'payment_received'].includes(String(t.type))) {
+    if (!['credit_given', 'payment_received', 'credit_reversal'].includes(String(t.type))) {
       return {
         isValid: false,
         error: `Udhaar transaction "${t.id}" has an invalid type "${String(t.type)}".`,
@@ -431,6 +497,8 @@ export function validateShopBackup(raw: unknown): BackupValidationResult {
     }
   }
 
+  const nestedError = validateBackupRecords(candidate);
+  if (nestedError) return { isValid: false, error: nestedError };
   // Sanitized cast
   const validatedBackup = candidate as unknown as DukaanShopBackup;
 
@@ -511,6 +579,7 @@ export function restoreBackupToStore(
 
   const activeProfile = getActiveProfile();
   const profileId = targetProfileId || activeProfile.id;
+  if (profileId !== activeProfile.id) return { success: false, error: 'Switch to the target shop before restoring.' };
 
   // Preserve the slot ID so other shop profile pointers stay intact
   const restoredProfile: ShopProfile = {
@@ -521,6 +590,7 @@ export function restoreBackupToStore(
   };
 
   const restoredStoreData: DukaanStoreData = {
+    revision: getStoreData().revision,
     profile: restoredProfile,
     shopName: restoredProfile.shopName,
     shopkeeperName: restoredProfile.ownerName,
@@ -543,8 +613,14 @@ export function restoreBackupToStore(
     lastResetAt: new Date().toISOString(),
   };
 
+  if (!preserveRecoverySnapshot()) return { success: false, error: 'Cannot preserve pre-restore snapshot. Restore cancelled.' };
   // Atomically save using storage architecture
-  saveStoreData(restoredStoreData);
+  if (!saveStoreData(restoredStoreData)) {
+    return {
+      success: false,
+      error: 'बैकअप डेटा डिवाइस स्टोरेज में सुरक्षित नहीं हो सका (मेमोरी फुल या परमिशन एरर)।',
+    };
+  }
 
   return { success: true };
 }

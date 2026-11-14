@@ -20,8 +20,14 @@ import {
   Package,
   X,
   Sparkles,
+  Camera,
+  Printer,
+  Plus,
+  Minus,
+  Tag,
 } from 'lucide-react';
 import { Product, SaleItem, PaymentMode, Customer, Sale, ShopProfile } from '../../types';
+import { BarcodeScannerModal } from './BarcodeScannerModal';
 import {
   formatCurrency,
   formatDate,
@@ -72,15 +78,28 @@ export const SalesTab: React.FC<SalesTabProps> = ({
   // POS Billing State
   const [selectedProductId, setSelectedProductId] = useState<string>('');
   const [itemQuantity, setItemQuantity] = useState<string>('1');
-  const [cartItems, setCartItems] = useState<SaleItem[]>([]);
+  const [cartItems, setCartItemsState] = useState<SaleItem[]>([]);
   const [paymentMode, setPaymentMode] = useState<PaymentMode>('cash');
   const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
 
+  // Barcode Scanner Modal State
+  const [isBarcodeModalOpen, setIsBarcodeModalOpen] = useState<boolean>(false);
+
+  // Discount & Tendered Cash State
+  const [discountType, setDiscountTypeState] = useState<'flat' | 'percentage'>('flat');
+  const [discountValue, setDiscountValueState] = useState<string>('');
+  const [cashTendered, setCashTendered] = useState<string>('');
+  const [activeTransactionRef, setActiveTransactionRef] = useState<string>(() => `DS-TR-${crypto.randomUUID()}`);
+
+  const [billRevision, setBillRevision] = useState(0);
+  const setCartItems: React.Dispatch<React.SetStateAction<SaleItem[]>> = value => { setBillRevision(revision => revision + 1); setCartItemsState(value); };
+  const setDiscountType: React.Dispatch<React.SetStateAction<'flat'|'percentage'>> = value => { setBillRevision(revision => revision + 1); setDiscountTypeState(value); };
+  const setDiscountValue: React.Dispatch<React.SetStateAction<string>> = value => { setBillRevision(revision => revision + 1); setDiscountValueState(value); };
   // Static UPI QR & Payment State
-  const [upiPaymentStatus, setUpiPaymentStatus] = useState<'pending' | 'manually_confirmed'>('pending');
+  const [confirmedBill, setConfirmedBill] = useState<string | null>(null);
   const [qrImageError, setQrImageError] = useState<boolean>(false);
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [isEditingUpiId, setIsEditingUpiId] = useState<boolean>(false);
@@ -129,7 +148,9 @@ export const SalesTab: React.FC<SalesTabProps> = ({
         (p.size && p.size.toLowerCase().includes(q)) ||
         (p.color && p.color.toLowerCase().includes(q)) ||
         (p.batchNumber && p.batchNumber.toLowerCase().includes(q)) ||
-        (p.warranty && p.warranty.toLowerCase().includes(q))
+        (p.warranty && p.warranty.toLowerCase().includes(q)) ||
+        (p.sku && p.sku.toLowerCase().includes(q)) ||
+        (p.barcode && p.barcode.toLowerCase().includes(q))
       );
     });
   }, [products, searchFilter, selectedCategory]);
@@ -139,25 +160,55 @@ export const SalesTab: React.FC<SalesTabProps> = ({
   const isUntracked = (p: Product) => p.currentStock === null;
   const isUnpriced = (p: Product) => p.sellingPrice === null || p.sellingPrice <= 0;
 
-  // Calculate Cart Total
-  const cartTotal = useMemo(() => {
-    return cartItems.reduce((acc, item) => acc + item.totalPrice, 0);
+  // Subtotal (Sum of Cart Line Items)
+  const cartSubtotal = useMemo(() => {
+    return roundPrecision(cartItems.reduce((acc, item) => acc + item.totalPrice, 0), 2);
   }, [cartItems]);
+
+  // Validated Discount Amount
+  const discountAmount = useMemo(() => {
+    const val = parseFloat(discountValue);
+    if (isNaN(val) || val <= 0 || cartSubtotal <= 0) return 0;
+    if (discountType === 'flat') {
+      return roundPrecision(Math.min(cartSubtotal, val), 2);
+    }
+    // Percentage
+    const pctAmount = roundPrecision((cartSubtotal * Math.min(100, val)) / 100, 2);
+    return Math.min(cartSubtotal, pctAmount);
+  }, [cartSubtotal, discountType, discountValue]);
+
+  // Final Total (Payable Amount)
+  const finalPayableTotal = useMemo(() => {
+    return roundPrecision(Math.max(0, cartSubtotal - discountAmount), 2);
+  }, [cartSubtotal, discountAmount]);
+
+  // Backward-compatible alias for existing total references
+  const cartTotal = finalPayableTotal;
+  const billFingerprint = JSON.stringify([billRevision, activeProfile.id, cartItems, finalPayableTotal, activeUpiId, paymentMode, selectedCustomerId, discountType, discountValue, activeTransactionRef]);
+  const upiPaymentStatus = confirmedBill === billFingerprint ? 'manually_confirmed' : 'pending';
+
+  // Cash Change Calculation
+  const cashChangeDue = useMemo(() => {
+    const tendered = parseFloat(cashTendered);
+    if (isNaN(tendered) || tendered < finalPayableTotal) return 0;
+    return roundPrecision(tendered - finalPayableTotal, 2);
+  }, [cashTendered, finalPayableTotal]);
 
   // Construct standard NPCI UPI payment deep link URI
   const upiPaymentUri = useMemo(() => {
-    if (paymentMode !== 'online' || cartTotal <= 0) return '';
+    if (paymentMode !== 'online' || finalPayableTotal <= 0) return '';
     return buildUpiPaymentUri({
       upiId: activeUpiId,
       payeeName: activeProfile?.shopName || 'Store Merchant',
-      amount: cartTotal,
-      transactionNote: `Bill at ${activeProfile?.shopName || 'Store'}`,
+      amount: finalPayableTotal,
+      transactionNote: `Bill ${activeProfile?.shopName ? `at ${activeProfile.shopName}` : ''} - Ref: ${activeTransactionRef}`,
     });
-  }, [paymentMode, cartTotal, activeUpiId, activeProfile?.shopName]);
+  }, [paymentMode, finalPayableTotal, activeUpiId, activeProfile, activeTransactionRef]);
 
   const handleSaveUpiId = () => {
     if (customUpiId.trim()) {
-      updateShopProfile({ upiId: customUpiId.trim() });
+      const result = updateShopProfile({ upiId: customUpiId.trim() });
+      if (!result.success) { setErrorMessage(result.error || 'UPI ID save failed'); return; }
       setIsEditingUpiId(false);
       onRefresh();
     }
@@ -175,7 +226,7 @@ export const SalesTab: React.FC<SalesTabProps> = ({
     setPaymentMode(mode);
     setErrorMessage(null);
     if (mode === 'online') {
-      setUpiPaymentStatus('pending');
+      setConfirmedBill(null);
     }
   };
 
@@ -302,6 +353,43 @@ export const SalesTab: React.FC<SalesTabProps> = ({
     setCartItems(cartItems.filter((i) => i.productId !== productId));
   };
 
+  // Adjust Cart Item Quantity (+ / -)
+  const handleUpdateCartItemQty = (productId: string, delta: number) => {
+    setErrorMessage(null);
+    const existingIndex = cartItems.findIndex((i) => i.productId === productId);
+    if (existingIndex === -1) return;
+
+    const currentItem = cartItems[existingIndex];
+    const prod = products.find((p) => p.id === productId);
+
+    const isFractionalUnit =
+      prod && ['kg', 'litre', 'gm', 'g', 'ml', 'meter', 'metre'].includes(prod.unit.toLowerCase());
+    const step = isFractionalUnit ? (Math.abs(delta) < 1 ? delta : delta > 0 ? 0.5 : -0.5) : delta;
+    const newQty = roundPrecision(currentItem.quantity + step, 3);
+
+    if (newQty <= 0) {
+      handleRemoveFromCart(productId);
+      return;
+    }
+
+    if (prod && prod.currentStock !== null && newQty > prod.currentStock) {
+      setErrorMessage(
+        `Insufficient stock! Only ${prod.currentStock} ${prod.unit} available for ${prod.name}.`
+      );
+      return;
+    }
+
+    const updated = [...cartItems];
+    updated[existingIndex].quantity = newQty;
+    updated[existingIndex].totalPrice = roundPrecision(currentItem.unitPrice * newQty, 2);
+    setCartItems(updated);
+  };
+
+  // Add Product Scanned via Barcode
+  const handleProductScanned = (product: Product) => {
+    handleDirectAdd(product, 1);
+  };
+
   // Finalize Sale
   const handleConfirmSale = () => {
     if (isSubmittingRef.current || isSubmitting) return;
@@ -320,7 +408,7 @@ export const SalesTab: React.FC<SalesTabProps> = ({
     // CRITICAL STOCK & PAYMENT SAFETY (Requirement 7):
     // Do NOT call recordSale() for a pending UPI payment.
     // Sale is finalized and stock is deducted only after explicit cashier manual confirmation.
-    if (paymentMode === 'online' && upiPaymentStatus !== 'manually_confirmed') {
+    if (paymentMode === 'online' && (!activeUpiId || upiPaymentStatus !== 'manually_confirmed')) {
       setErrorMessage(
         'UPI payment is pending. Please verify incoming funds via soundbox or merchant SMS and click "Mark Manually Confirmed" before completing the bill.'
       );
@@ -335,13 +423,26 @@ export const SalesTab: React.FC<SalesTabProps> = ({
           ? ` [UPI Static QR - Manual Cashier Confirmation (Unverified)${activeUpiId ? ` • VPA: ${activeUpiId}` : ''}]`
           : '';
 
+      const parsedDiscountVal = parseFloat(discountValue);
+      const parsedCashTendered = parseFloat(cashTendered);
+
       const res = recordSale({
+        operationId: activeTransactionRef,
+        shopId: activeProfile.id,
         items: cartItems,
         paymentMode,
         customerId: paymentMode === 'udhaar' ? selectedCustomerId : undefined,
         notes: (notes.trim() + upiNotesSuffix).trim() || undefined,
         upiId: paymentMode === 'online' ? activeUpiId : undefined,
         paymentStatus: paymentMode === 'online' ? 'manually_confirmed' : 'completed',
+        subtotal: cartSubtotal,
+        discountAmount: discountAmount > 0 ? discountAmount : undefined,
+        discountType: discountAmount > 0 ? discountType : undefined,
+        discountValue: discountAmount > 0 && !isNaN(parsedDiscountVal) ? parsedDiscountVal : undefined,
+        cashReceived: paymentMode === 'cash' && !isNaN(parsedCashTendered) ? parsedCashTendered : undefined,
+        changeDue: paymentMode === 'cash' && cashChangeDue > 0 ? cashChangeDue : undefined,
+        paymentVerificationStatus: paymentMode === 'online' ? 'pending_verification' : 'paid',
+        transactionRef: paymentMode === 'online' ? activeTransactionRef : undefined,
       });
 
       if (!res.success) {
@@ -355,7 +456,10 @@ export const SalesTab: React.FC<SalesTabProps> = ({
       setSelectedProductId('');
       setItemQuantity('1');
       setNotes('');
-      setUpiPaymentStatus('pending');
+      setDiscountValue('');
+      setCashTendered('');
+      setActiveTransactionRef(`DS-TR-${Date.now()}`);
+      setConfirmedBill(null);
       onRefresh();
     } finally {
       isSubmittingRef.current = false;
@@ -417,6 +521,15 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                   <Sparkles className="w-4 h-4 text-amber-600" />
                   <span>Load Demo Kirana Store</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setIsBarcodeModalOpen(true)}
+                  className="w-full sm:w-auto px-4 py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-2xs"
+                  title="Scan Barcode via Camera / Manual"
+                >
+                  <Camera className="w-4 h-4 text-emerald-600" />
+                  <span>Scan Barcode / SKU</span>
+                </button>
               </div>
             </div>
           ) : (
@@ -454,15 +567,26 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                     </button>
                   )}
                 </div>
-                <div className="relative">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    value={searchFilter}
-                    onChange={(e) => setSearchFilter(e.target.value)}
-                    placeholder={`Search (e.g. ${businessConfig.starterItems.slice(0, 3).map((i) => i.name).join(', ')})...`}
-                    className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500 focus:outline-none text-slate-800"
-                  />
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={searchFilter}
+                      onChange={(e) => setSearchFilter(e.target.value)}
+                      placeholder={`Search name, SKU, or barcode (e.g. ${businessConfig.starterItems.slice(0, 3).map((i) => i.name).join(', ')})...`}
+                      className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500 focus:outline-none text-slate-800"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsBarcodeModalOpen(true)}
+                    className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition shadow-2xs shrink-0 cursor-pointer"
+                    title="Scan Barcode via Camera / Manual"
+                  >
+                    <Camera className="w-4 h-4 text-emerald-600" />
+                    <span className="hidden sm:inline">Scan Barcode</span>
+                  </button>
                 </div>
               </div>
 
@@ -892,12 +1016,36 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                           </div>
                         </div>
                       <div className="flex items-center space-x-2">
-                        <span className="font-bold text-slate-900 text-xs sm:text-sm">
+                        {/* Qty +/- Controls */}
+                        <div className="flex items-center border border-slate-200 rounded-lg bg-slate-50 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateCartItemQty(item.productId, -1)}
+                            className="p-1 hover:bg-slate-200 text-slate-600 transition"
+                            title="Decrease quantity"
+                          >
+                            <Minus className="w-3 h-3" />
+                          </button>
+                          <span className="px-1.5 text-xs font-bold text-slate-800 min-w-6 text-center">
+                            {item.quantity}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateCartItemQty(item.productId, 1)}
+                            className="p-1 hover:bg-slate-200 text-slate-600 transition"
+                            title="Increase quantity"
+                          >
+                            <Plus className="w-3 h-3" />
+                          </button>
+                        </div>
+                        <span className="font-bold text-slate-900 text-xs sm:text-sm min-w-14 text-right">
                           {formatCurrency(item.totalPrice)}
                         </span>
                         <button
+                          type="button"
                           onClick={() => handleRemoveFromCart(item.productId)}
                           className="p-1 text-slate-400 hover:text-red-600 rounded-md"
+                          title="Remove item"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -908,13 +1056,116 @@ export const SalesTab: React.FC<SalesTabProps> = ({
               )}
               </div>
 
-              {/* Grand Total Bar */}
-              <div className="mt-4 p-3 bg-slate-50 rounded-xl border border-slate-200 flex items-center justify-between">
-                <span className="font-bold text-slate-700 text-sm">Total Amount</span>
-                <span className="font-extrabold text-xl sm:text-2xl text-emerald-700">
-                  {formatCurrency(cartTotal)}
-                </span>
+              {/* Bill Financials: Subtotal, Discount & Final Total */}
+              <div className="mt-4 p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between text-xs text-slate-600">
+                  <span>Subtotal ({cartItems.length} items)</span>
+                  <span className="font-semibold">{formatCurrency(cartSubtotal)}</span>
+                </div>
+
+                {/* Discount Row */}
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/60 text-xs">
+                  <div className="flex items-center gap-1">
+                    <Tag className="w-3.5 h-3.5 text-slate-500" />
+                    <span className="font-semibold text-slate-700">Discount:</span>
+                    <div className="flex rounded-md border border-slate-300 bg-white overflow-hidden text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setDiscountType('flat')}
+                        className={`px-1.5 py-0.5 ${discountType === 'flat' ? 'bg-emerald-600 text-white font-bold' : 'text-slate-600 hover:bg-slate-100'}`}
+                      >
+                        ₹ Flat
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDiscountType('percentage')}
+                        className={`px-1.5 py-0.5 ${discountType === 'percentage' ? 'bg-emerald-600 text-white font-bold' : 'text-slate-600 hover:bg-slate-100'}`}
+                      >
+                        %
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      placeholder={discountType === 'flat' ? '0' : '0%'}
+                      value={discountValue}
+                      onChange={(e) => setDiscountValue(e.target.value)}
+                      className="w-16 px-1.5 py-0.5 text-right text-xs border border-slate-300 rounded bg-white font-bold text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                    {discountAmount > 0 && (
+                      <span className="font-bold text-emerald-700 text-xs">
+                        -{formatCurrency(discountAmount)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Grand Total */}
+                <div className="flex items-center justify-between pt-1 border-t border-slate-200 text-sm">
+                  <span className="font-extrabold text-slate-800">Final Payable</span>
+                  <span className="font-extrabold text-xl text-emerald-700">
+                    {formatCurrency(finalPayableTotal)}
+                  </span>
+                </div>
               </div>
+
+              {/* Cash Payment Mode: Cash Received & Change Calculation */}
+              {paymentMode === 'cash' && cartItems.length > 0 && (
+                <div className="mt-3 p-3 bg-emerald-50/70 border border-emerald-200 rounded-xl space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <label className="font-bold text-emerald-950 flex items-center gap-1">
+                      <Banknote className="w-3.5 h-3.5 text-emerald-700" />
+                      <span>Cash Received:</span>
+                    </label>
+                    <input
+                      type="number"
+                      min={finalPayableTotal}
+                      placeholder={`₹${finalPayableTotal}`}
+                      value={cashTendered}
+                      onChange={(e) => setCashTendered(e.target.value)}
+                      className="w-24 px-2 py-1 text-right text-xs font-bold border border-emerald-300 rounded-lg bg-white text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  {/* Quick cash tender chips */}
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <span className="text-[10px] text-emerald-800">Quick:</span>
+                    <button
+                      type="button"
+                      onClick={() => setCashTendered(finalPayableTotal.toString())}
+                      className="px-2 py-0.5 rounded bg-white hover:bg-emerald-100 border border-emerald-200 text-[11px] font-semibold text-emerald-800 cursor-pointer"
+                    >
+                      Exact (₹{finalPayableTotal})
+                    </button>
+                    {[100, 200, 500, 1000, 2000]
+                      .filter((val) => val >= finalPayableTotal)
+                      .slice(0, 3)
+                      .map((val) => (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => setCashTendered(val.toString())}
+                          className="px-2 py-0.5 rounded bg-white hover:bg-emerald-100 border border-emerald-200 text-[11px] font-semibold text-emerald-800 cursor-pointer"
+                        >
+                          ₹{val}
+                        </button>
+                      ))}
+                  </div>
+
+                  {cashChangeDue > 0 && (
+                    <div className="flex items-center justify-between pt-1 border-t border-emerald-200 font-bold text-emerald-900">
+                      <span>Change to Return (वापस करें):</span>
+                      <span className="text-sm font-extrabold text-emerald-700 bg-white px-2 py-0.5 rounded border border-emerald-300">
+                        {formatCurrency(cashChangeDue)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Payment Mode Selector */}
               <div className="mt-4 space-y-2">
@@ -1152,7 +1403,7 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                         <button
                           type="button"
                           onClick={() => {
-                            setUpiPaymentStatus('manually_confirmed');
+                            setConfirmedBill(billFingerprint);
                             setErrorMessage(null);
                           }}
                           className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
@@ -1163,7 +1414,7 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                       ) : (
                         <button
                           type="button"
-                          onClick={() => setUpiPaymentStatus('pending')}
+                          onClick={() => setConfirmedBill(null)}
                           className="px-2.5 py-1 text-slate-500 hover:text-slate-700 bg-white border border-slate-200 rounded-lg text-xs font-medium cursor-pointer"
                         >
                           Revert to Pending
@@ -1188,12 +1439,12 @@ export const SalesTab: React.FC<SalesTabProps> = ({
                     <option value="">-- Select Customer --</option>
                     {customers.map((c) => (
                       <option key={c.id} value={c.id}>
-                        {c.name} (Balance: {formatCurrency(c.currentBalance)})
+                        {c.name} (Debt: {formatCurrency(c.currentBalance)}{c.advanceBalance && c.advanceBalance > 0 ? ` • Advance: ${formatCurrency(c.advanceBalance)}` : ''})
                       </option>
                     ))}
                   </select>
                   <p className="text-[11px] text-red-700 mt-1">
-                    This amount will be added to the customer&apos;s credit ledger.
+                    This amount will be deducted from customer&apos;s advance deposit first, or added to credit ledger.
                   </p>
                 </div>
               )}
@@ -1259,58 +1510,122 @@ export const SalesTab: React.FC<SalesTabProps> = ({
       {/* Bill Success / Receipt Modal */}
       {completedSale && (
         <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="relative bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 text-center animate-in zoom-in-95">
-            <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto mb-3">
-              <CheckCircle2 className="w-6 h-6" />
+          <div className="relative bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 text-center animate-in zoom-in-95">
+            <div className="no-print">
+              <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto mb-3">
+                <CheckCircle2 className="w-6 h-6" />
+              </div>
+              <h3 className="font-bold text-slate-900 text-lg">Sale Recorded Successfully!</h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Invoice No: <span className="font-bold text-slate-800">{completedSale.invoiceNo}</span>
+              </p>
             </div>
-            <h3 className="font-bold text-slate-900 text-lg">Sale Recorded Successfully!</h3>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Invoice No: <span className="font-bold text-slate-800">{completedSale.invoiceNo}</span>
-            </p>
 
-            <div className="mt-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-left text-xs space-y-1.5">
-              <div className="flex justify-between font-bold text-slate-800 text-sm pb-1 border-b border-slate-200">
-                <span>Total Amount</span>
-                <span className="text-emerald-700">{formatCurrency(completedSale.totalAmount)}</span>
-              </div>
-              <div className="flex justify-between text-slate-600">
-                <span>Payment:</span>
-                <span className="font-semibold capitalize">
-                  {completedSale.paymentMode === 'cash'
-                    ? 'Cash'
-                    : completedSale.paymentMode === 'online'
-                    ? 'UPI / Online'
-                    : `Credit (${completedSale.customerName})`}
-                </span>
+            {/* Printable Thermal Receipt Card */}
+            <div id="printable-thermal-receipt" className="mt-4 p-4 bg-slate-50 rounded-xl border border-slate-200 text-left text-xs font-mono space-y-2">
+              <div className="text-center pb-2 border-b border-dashed border-slate-300">
+                <div className="font-bold text-sm text-slate-900 uppercase">
+                  {activeProfile?.shopName || 'Dukaan Sathi Store'}
+                </div>
+                {activeProfile?.address && (
+                  <div className="text-[10px] text-slate-600">{activeProfile.address}</div>
+                )}
+                {activeProfile?.phone && (
+                  <div className="text-[10px] text-slate-600">Tel: {activeProfile.phone}</div>
+                )}
+                <div className="text-[10px] text-slate-500 mt-1">
+                  Inv: {completedSale.invoiceNo} • {new Date(completedSale.createdAt).toLocaleString('en-IN')}
+                </div>
               </div>
 
-              {completedSale.paymentMode === 'online' && (
-                <>
-                  {completedSale.upiId && (
-                    <div className="flex justify-between text-slate-600">
-                      <span>UPI ID:</span>
-                      <span className="font-mono text-[11px] text-slate-800">{completedSale.upiId}</span>
+              {/* Items List */}
+              <div className="py-2 border-b border-dashed border-slate-300 space-y-1.5">
+                <div className="flex justify-between font-bold text-[11px] text-slate-700">
+                  <span>Item</span>
+                  <span>Qty × Rate = Amt</span>
+                </div>
+                {completedSale.items.map((it, idx) => (
+                  <div key={idx} className="flex justify-between items-start text-[11px]">
+                    <div className="max-w-[55%]">
+                      <div className="font-semibold text-slate-800">{it.productName}</div>
+                      {(it.size || it.color || it.brandOrVariant) && (
+                        <div className="text-[9px] text-slate-500">
+                          {[it.brandOrVariant, it.size ? `Sz:${it.size}` : null, it.color].filter(Boolean).join(' ')}
+                        </div>
+                      )}
                     </div>
-                  )}
-                  <div className="flex justify-between items-center text-slate-600 pt-1 border-t border-slate-100">
-                    <span>Verification:</span>
-                    <span className="text-amber-800 font-medium text-[10px] bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
-                      Manual Confirmation (Unverified)
-                    </span>
+                    <div className="text-right">
+                      {it.quantity}{it.unit} × ₹{it.unitPrice} = <span className="font-bold">₹{it.totalPrice}</span>
+                    </div>
                   </div>
-                </>
-              )}
+                ))}
+              </div>
 
-              <div className="flex justify-between text-slate-600">
-                <span>Items:</span>
-                <span>{completedSale.items.length} items</span>
+              {/* Financial Totals */}
+              <div className="pt-1 pb-2 border-b border-dashed border-slate-300 space-y-1">
+                {completedSale.subtotal !== undefined && completedSale.subtotal !== completedSale.totalAmount && (
+                  <div className="flex justify-between text-slate-600">
+                    <span>Subtotal:</span>
+                    <span>₹{completedSale.subtotal}</span>
+                  </div>
+                )}
+                {completedSale.discountAmount !== undefined && completedSale.discountAmount > 0 && (
+                  <div className="flex justify-between text-emerald-700 font-semibold">
+                    <span>Discount:</span>
+                    <span>-₹{completedSale.discountAmount}</span>
+                  </div>
+                )}
+                <div className="flex justify-between font-extrabold text-sm text-slate-900 pt-0.5">
+                  <span>TOTAL:</span>
+                  <span>₹{completedSale.totalAmount}</span>
+                </div>
+              </div>
+
+              {/* Payment Details */}
+              <div className="pt-1 space-y-1 text-[11px] text-slate-600">
+                <div className="flex justify-between">
+                  <span>Payment Mode:</span>
+                  <span className="font-bold capitalize">{completedSale.paymentMode}</span>
+                </div>
+                {completedSale.cashReceived !== undefined && (
+                  <div className="flex justify-between">
+                    <span>Cash Tendered:</span>
+                    <span>₹{completedSale.cashReceived}</span>
+                  </div>
+                )}
+                {completedSale.changeDue !== undefined && completedSale.changeDue > 0 && (
+                  <div className="flex justify-between font-bold text-emerald-700">
+                    <span>Change Returned:</span>
+                    <span>₹{completedSale.changeDue}</span>
+                  </div>
+                )}
+                {completedSale.transactionRef && (
+                  <div className="flex justify-between font-mono text-[10px]">
+                    <span>Txn Ref:</span>
+                    <span>{completedSale.transactionRef}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="text-center pt-2 text-[10px] text-slate-500">
+                *** धन्यवाद! फिर पधारें ***
               </div>
             </div>
 
-            <div className="mt-5 flex gap-2">
+            {/* Action Buttons */}
+            <div className="mt-5 flex gap-2 no-print">
               <button
+                type="button"
+                onClick={() => window.print()}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition-colors flex items-center justify-center gap-1.5 cursor-pointer border border-slate-200"
+              >
+                <Printer className="w-4 h-4 text-slate-600" />
+                <span>Print Receipt (प्रिंट करें)</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setCompletedSale(null)}
-                className="w-full py-2.5 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 transition-colors cursor-pointer"
+                className="flex-1 py-2.5 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 transition-colors cursor-pointer"
               >
                 Create Next Bill (Done)
               </button>
@@ -1318,6 +1633,42 @@ export const SalesTab: React.FC<SalesTabProps> = ({
           </div>
         </div>
       )}
+
+      {/* Barcode Scanner Modal */}
+      <BarcodeScannerModal
+        isOpen={isBarcodeModalOpen}
+        onClose={() => setIsBarcodeModalOpen(false)}
+        products={products}
+        onProductScanned={handleProductScanned}
+        onRefresh={onRefresh}
+      />
+
+      {/* Global Print Stylesheet for Thermal Receipts */}
+      <style jsx global>{`
+        @media print {
+          body * {
+            visibility: hidden;
+          }
+          #printable-thermal-receipt,
+          #printable-thermal-receipt * {
+            visibility: visible;
+          }
+          #printable-thermal-receipt {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 80mm;
+            margin: 0;
+            padding: 10px;
+            font-size: 11px;
+            color: #000 !important;
+            background: #fff !important;
+          }
+          .no-print {
+            display: none !important;
+          }
+        }
+      `}</style>
 
       {/* Sales History List */}
       <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-xs">

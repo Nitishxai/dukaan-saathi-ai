@@ -1,9 +1,10 @@
 'use client';
+import { AccessibleDialog } from '../AccessibleDialog';
 
 import React, { useState, useMemo } from 'react';
 import { Store, User, Phone, MapPin, Sparkles, CheckCircle2, ArrowRight } from 'lucide-react';
 import { ShopProfile } from '../../types';
-import { updateShopProfile, saveProductsBatch } from '../../lib/storage';
+import { loadDemoShop, updateShopProfile, saveProductsBatch } from '../../lib/storage';
 import {
   BUSINESS_TYPES,
   getBusinessTypeConfig,
@@ -82,7 +83,7 @@ export const ShopOnboardingModal: React.FC<ShopOnboardingModalProps> = ({
         : currentConfig.title;
 
     // 1. Update Profile with Business Type & Optional Description
-    updateShopProfile({
+    const profileResult = updateShopProfile({
       shopName: shopName.trim(),
       ownerName: ownerName.trim(),
       category: effectiveCategory,
@@ -91,9 +92,10 @@ export const ShopOnboardingModal: React.FC<ShopOnboardingModalProps> = ({
       description: description.trim() || undefined,
       phone: phone.trim() || undefined,
       address: address.trim() || undefined,
-      isOnboarded: true,
+      isOnboarded: false,
     });
 
+    if (!profileResult.success) { setError(profileResult.error || 'Profile save nahi hua. Dobara koshish karein.'); return; }
     // 2. Add Selected Starter Products if any
     if (selectedStarters.length > 0) {
       const itemsToAdd = currentConfig.starterItems
@@ -106,14 +108,17 @@ export const ShopOnboardingModal: React.FC<ShopOnboardingModalProps> = ({
           sellingPrice: null, // Price not yet set
           minStockAlert: 5,
         }));
-      saveProductsBatch(itemsToAdd);
+      const result = saveProductsBatch(itemsToAdd);
+      if (!result.success) { setError(result.error || 'Products save nahi hue. Profile draft safe hai.'); return; }
     }
 
+    const completed = updateShopProfile({ isOnboarded: true });
+    if (!completed.success) { setError(completed.error || 'Setup could not finish. Please retry.'); return; }
     onComplete();
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
+    <AccessibleDialog label="Set up your shop" className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
       <div className="relative bg-white rounded-3xl max-w-lg w-full p-6 sm:p-8 shadow-2xl border border-slate-100 space-y-5">
         {/* Header Icon & Title */}
         <div className="text-center space-y-2">
@@ -121,15 +126,22 @@ export const ShopOnboardingModal: React.FC<ShopOnboardingModalProps> = ({
             <Store className="w-7 h-7" />
           </div>
           <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight">
-            Welcome to Dukaan Sathi AI!
+            Apna dukaan counter shuru karein
           </h2>
           <p className="text-xs sm:text-sm text-slate-600 font-medium">
-            Customize your store type to tailor categories, units, and inventory.
+            Neeche apni dukaan set up karein, ya demo mein aadha kilo cheeni ka cash bill bana kar dekhein.
           </p>
+            <button type="button" className="rounded-lg px-4 py-2 text-sm font-semibold text-emerald-800 underline" onClick={() => {
+              try { loadDemoShop(); } catch { setError('Demo nahi khula. Storage aur doosre tab ki jaanch karein.'); }
+            }}>Pehle demo dukaan dekhein</button>
+          <p className="text-xs text-slate-600">
+            Practice bill alag demo dukaan mein save hoga.
+          </p>
+
         </div>
 
         {error && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 font-semibold text-center">
+          <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 font-semibold text-center">
             {error}
           </div>
         )}
@@ -303,6 +315,6 @@ export const ShopOnboardingModal: React.FC<ShopOnboardingModalProps> = ({
           </div>
         </form>
       </div>
-    </div>
+    </AccessibleDialog>
   );
 };

@@ -81,7 +81,11 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
   const handleQuickAdd = (product: Product) => {
     const deltas = getQuickAdjustDeltas(product.unit);
     const suggested = Math.max(product.minStockAlert * 2, deltas.deltaLarge);
-    quickAddStock(product.id, suggested);
+    const res = quickAddStock(product.id, suggested);
+    if (!res.success) {
+      alert(res.error || 'स्टॉक अपडेट नहीं हो सका');
+      return;
+    }
     onRefresh();
   };
 
@@ -161,9 +165,15 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
             <div className="flex items-center justify-between mt-1 text-[11px] text-slate-500">
               <span>{dailySales.completedSalesCount} bills</span>
               <span className="text-emerald-700 font-bold">
-                Cash {formatCurrency(dailySales.cashSales)} • UPI {formatCurrency(dailySales.onlineSales)}
+                Cash {formatCurrency(dailySales.cashSales)} • UPI booked {formatCurrency(dailySales.onlineSales)}
               </span>
             </div>
+            <dl className="mt-3 text-xs space-y-1" aria-label="Payment breakdown">
+              <div>Recorded collections: {formatCurrency(dailySales.confirmedCollections)}</div>
+              <div>UPI manually confirmed: {formatCurrency(dailySales.manuallyConfirmedOnline)}</div>
+              <div>UPI pending / unknown: {formatCurrency(dailySales.pendingOnline)}</div>
+              <div>UPI failed: {formatCurrency(dailySales.failedOnline)} · Cancelled: {formatCurrency(dailySales.cancelledOnline)}</div>
+            </dl>
             {dailySales.udhaarSales > 0 && (
               <div className="text-[10px] text-amber-700 font-semibold mt-0.5">
                 Credit Sales: {formatCurrency(dailySales.udhaarSales)}

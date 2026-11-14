@@ -60,6 +60,11 @@ export interface Product {
   warranty?: string; // Electronics / Mobile: 1 Year, 6 Months
   batchNumber?: string; // Pharmacy: B-1049
   expiryDate?: string; // Pharmacy / Grocery: 2026-12
+  // Barcode & SKU identifiers
+  barcode?: string; // Standard barcode (e.g. EAN-13, UPC, Code 128)
+  sku?: string; // Internal or vendor Stock Keeping Unit
+  description?: string; // Optional detailed description
+  parentProductId?: string; // Links variants to a parent product group
 }
 
 export type StockStatusClassification = 'out_of_stock' | 'low_stock' | 'adequate' | 'unrecorded';
@@ -71,15 +76,38 @@ export interface SaleItem {
   quantity: number;
   unitPrice: number;
   totalPrice: number;
+  barcode?: string;
+  sku?: string;
+  size?: string;
+  color?: string;
+  brandOrVariant?: string;
 }
 
 export type PaymentMode = 'cash' | 'online' | 'udhaar';
 
+export type PaymentVerificationStatus =
+  | 'paid'
+  | 'pending_verification'
+  | 'failed'
+  | 'cancelled'
+  | 'partially_paid';
+
 export interface Sale {
+  reversedAt?: string;
+  reversalReason?: string;
+  refundRecordedAt?: string;
+  operationId?: string;
+  operationPayload?: string;
   id: string;
   invoiceNo: string;
   items: SaleItem[];
   totalAmount: number;
+  subtotal?: number; // Pre-discount items sum
+  discountAmount?: number; // Applied discount in INR (₹)
+  discountType?: 'flat' | 'percentage';
+  discountValue?: number;
+  cashReceived?: number; // Amount tendered by customer in cash
+  changeDue?: number; // Change returned to customer
   paymentMode: PaymentMode;
   customerId?: string; // if paymentMode is 'udhaar'
   customerName?: string;
@@ -87,9 +115,11 @@ export interface Sale {
   notes?: string;
   upiId?: string; // Configured UPI ID if paid via UPI
   paymentStatus?: 'completed' | 'manually_confirmed'; // Explicitly tracks unverified manual confirmations
+  paymentVerificationStatus?: PaymentVerificationStatus; // Real-world payment lifecycle status
+  transactionRef?: string; // NPCI standard UPI transaction reference ID (e.g. "DS-TR-1729000-XYZ")
 }
 
-export type UdhaarType = 'credit_given' | 'payment_received'; // उधार दिया या जमा मिला
+export type UdhaarType = 'credit_given' | 'payment_received' | 'credit_reversal'; // उधार दिया या जमा मिला
 
 export interface UdhaarTransaction {
   id: string;
@@ -106,7 +136,8 @@ export interface Customer {
   name: string;
   phone: string;
   address?: string;
-  currentBalance: number; // positive means customer owes shopkeeper (उधार बाकी)
+  currentBalance: number; // positive means customer owes shopkeeper (उधार बाकी >= 0)
+  advanceBalance?: number; // advance deposit held by customer (अग्रिम / जमा राशि >= 0)
   lastTransactionAt?: string;
   createdAt: string;
 }
@@ -147,6 +178,7 @@ export interface ActivityLog {
 }
 
 export interface DukaanStoreData {
+  revision?: number;
   profile: ShopProfile;
   // Backward compatibility convenience fields mirroring profile
   shopName: string;
@@ -191,13 +223,67 @@ export interface ParsedProductItem {
   sellingPrice?: number | null;
   purchasePrice?: number | null;
   minStockAlert?: number;
+  barcode?: string;
+  sku?: string;
+  size?: string;
+  color?: string;
   isExisting?: boolean;
   matchedProductId?: string;
   updatedFields?: string[];
   missingFields?: string[];
 }
 
+export interface ProductDraftVariant {
+  size?: string;
+  color?: string;
+  stock: number;
+  sellingPrice?: number;
+  purchasePrice?: number;
+  sku?: string;
+  barcode?: string;
+}
+
+export type ProductConversationStep =
+  | 'idle'
+  | 'ask_name'
+  | 'ask_category'
+  | 'ask_variants'
+  | 'ask_price'
+  | 'ask_stock'
+  | 'ask_purchase_price'
+  | 'ask_barcode_sku'
+  | 'ask_min_stock'
+  | 'ready_for_confirmation';
+
+export interface ProductConversationState {
+  isActive: boolean;
+  step: ProductConversationStep;
+  draft: {
+    name?: string;
+    category?: string;
+    brand?: string;
+    unit?: UnitType;
+    sellingPrice?: number;
+    purchasePrice?: number;
+    openingStock?: number;
+    minStockAlert?: number;
+    sku?: string;
+    barcode?: string;
+    description?: string;
+    supplier?: string;
+    isVariantProduct?: boolean;
+    sizes?: string[];
+    colors?: string[];
+    variantDrafts?: ProductDraftVariant[];
+  };
+  history: Array<{ role: 'ai' | 'user'; text: string; timestamp: string }>;
+  existingProductMatch?: Product;
+  isUpdatingStock?: boolean;
+}
+
 export interface AIParseResult {
+  shopId?: string;
+  operationId?: string;
   rawText: string;
   intent: AIIntent;
   intentLabelHindi: string;
@@ -220,6 +306,15 @@ export interface AIParseResult {
 }
 
 export interface DailySalesSummary {
+  returnsToday: number;
+  refundsRecordedToday: number;
+  refundLiability: number;
+  netSales: number;
+  confirmedCollections: number;
+  manuallyConfirmedOnline: number;
+  pendingOnline: number;
+  failedOnline: number;
+  cancelledOnline: number;
   grossSales: number;
   completedSalesCount: number;
   cashSales: number;
@@ -238,6 +333,7 @@ export interface DailySalesSummary {
 }
 
 export interface AssistantApiRequest {
+  shopId?: string;
   message: string;
   inventory?: Array<
     Pick<Product, 'id' | 'name' | 'unit' | 'currentStock' | 'sellingPrice' | 'minStockAlert'> &

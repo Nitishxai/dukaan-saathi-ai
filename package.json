@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/regression.test.ts"
+    "test": "node --test tests/*.test.ts",
+    "pilot:create-user": "node scripts/create-user.ts",
+    "pilot:backup": "node scripts/backup-server.ts"
   },
   "dependencies": {
     "@google/genai": "^2.28.0",
@@ -26,5 +28,8 @@
     "eslint-config-next": "16.4.0",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=24.14.0 <25"
   }
 }

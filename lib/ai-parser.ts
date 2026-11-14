@@ -1,4 +1,4 @@
-import {
+import type {
   AIParseResult,
   Customer,
   Product,
@@ -7,7 +7,7 @@ import {
   DailySalesSummary,
   ParsedProductItem,
 } from '../types';
-import { saveProductsBatch, getStockClassification } from './storage';
+import { getStockClassification } from './storage.ts';
 
 // Hindi and Devanagari number word mapping
 const NUMBER_WORDS: Record<string, number> = {
@@ -302,9 +302,17 @@ export function parseInventoryItemsFromText(
     दाल: { name: 'दाल (Dal)', unit: 'kg', category: 'दालें / राशन' },
   };
 
-  // Check matching against keywordMap
+  // Check matching against keywordMap with word boundaries to avoid substring false positives (e.g. "price" matching "rice")
+  const normWords = norm.split(/\s+/);
   for (const [key, itemInfo] of Object.entries(keywordMap)) {
-    if (norm.includes(key)) {
+    const keyLower = key.toLowerCase();
+    const keyWords = keyLower.split(/\s+/);
+    const matches =
+      keyWords.length === 1
+        ? normWords.includes(keyWords[0])
+        : norm.includes(keyLower);
+
+    if (matches) {
       if (!detectedItems.some((d) => d.name === itemInfo.name)) {
         detectedItems.push({
           name: itemInfo.name,
@@ -347,8 +355,11 @@ export function parseInventoryItemsFromText(
     const missing: string[] = [];
     const updated: string[] = ['name'];
 
-    // Check opening stock in command
-    const stockMatch = norm.match(/(?:opening stock|stock|ओपनिंग स्टॉक|स्टॉक)\s*(\d+(?:\.\d+)?)\s*(kilo|kg|packet|litre|piece|gm|किलो|पैकेट|लीटर|पीस)?/i);
+    // Check opening stock in command (supports "opening stock 25 kg" or "25 kg opening stock")
+    const stockMatch =
+      norm.match(/(?:opening stock|stock|ओपनिंग स्टॉक|स्टॉक)\s*(?:hai|ka|ki)?\s*(\d+(?:\.\d+)?)\s*(kilo|kg|packet|litre|piece|gm|किलो|पैकेट|लीटर|पीस)?/i) ||
+      norm.match(/(\d+(?:\.\d+)?)\s*(kilo|kg|packet|litre|piece|gm|किलो|पैकेट|लीटर|पीस)?\s*(?:ka|ki)?\s*(?:opening stock|stock|ओपनिंग स्टॉक|स्टॉक)/i);
+
     if (stockMatch && stockMatch[1]) {
       const parsedStock = parseFloat(stockMatch[1]);
       if (!isNaN(parsedStock)) {
@@ -359,8 +370,11 @@ export function parseInventoryItemsFromText(
       missing.push('openingStock');
     }
 
-    // Check selling price in command
-    const priceMatch = norm.match(/(?:selling price|price|rate|कीमत|मूल्य|भाव)\s*(\d+(?:\.\d+)?)\s*(?:rupaye|rs|रुपये)?/i);
+    // Check selling price in command (supports "selling price 40 rupaye" or "40 rupaye selling price")
+    const priceMatch =
+      norm.match(/(?:selling price|price|rate|कीमत|मूल्य|भाव)\s*(?:hai|ka|ki)?\s*(\d+(?:\.\d+)?)\s*(?:rupaye|rs|रुपये)?/i) ||
+      norm.match(/(\d+(?:\.\d+)?)\s*(?:rupaye|rs|रुपये)?\s*(?:selling price|price|rate|कीमत|मूल्य|भाव)/i);
+
     if (priceMatch && priceMatch[1]) {
       const parsedPrice = parseFloat(priceMatch[1]);
       if (!isNaN(parsedPrice)) {
@@ -421,36 +435,30 @@ export function parseHinglishCommand(
     const parsedItems = parseInventoryItemsFromText(rawText, products);
 
     if (parsedItems.length > 0) {
-      // Auto-save unambiguous product items immediately into storage!
-      const saveResult = saveProductsBatch(parsedItems);
+      // Return parsed product items for explicit user confirmation preview — do not auto-save!
       const namesList = parsedItems.map((p) => p.name.split(' ')[0]).join(', ');
 
       const hasMissingStockOrPrice = parsedItems.some(
         (p) => p.openingStock === null || p.sellingPrice === null
       );
 
-      const msg = `आपकी दुकान में ${parsedItems.length} सामान सुरक्षित (Save) हो गए हैं: ${namesList}। ${
+      const msg = `इन्वेंटरी में ${parsedItems.length} सामान जोड़ने का प्रस्ताव: ${namesList}। ${
         hasMissingStockOrPrice
-          ? 'इनका स्टॉक या बिक्री मूल्य अभी दर्ज नहीं है — आप जब चाहें इन्वेंटरी टैब में जोड़ सकते हैं।'
-          : 'स्टॉक और कीमत भी अपडेट हो गई है।'
+          ? 'कृपया नीचे विवरण जांचें और सेव करने के लिए कन्फर्म करें।'
+          : 'कृपया नीचे विवरण जांचें और सेव करने के लिए कन्फर्म करें।'
       }`;
 
-      const spoken = `आपकी दुकान में ${parsedItems.length} सामान सेव हो गए हैं: ${namesList}। ${
-        hasMissingStockOrPrice
-          ? 'इनका ओपनिंग स्टॉक और रेट बाद में भी जोड़ सकते हैं।'
-          : ''
-      }`;
+      const spoken = `इन्वेंटरी में ${parsedItems.length} सामान जोड़ने के लिए तैयार है: ${namesList}। कृपया कन्फर्म करें।`;
 
       return {
         rawText,
         intent: 'inventory_add',
-        intentLabelHindi: 'इन्वेंटरी में सामान जोड़ा (Product Saved)',
+        intentLabelHindi: 'इन्वेंटरी में सामान जोड़ें (Preview)',
         confidence: 0.96,
         parsedProducts: parsedItems,
-        autoSavedCount: saveResult.savedProducts.length,
         message: msg,
         spokenResponse: spoken,
-        notes: `${saveResult.addedCount} नया सामान जोड़ा, ${saveResult.updatedCount} अपडेट किया`,
+        notes: `${parsedItems.length} सामान का प्रस्ताव — कृपया पुष्टि करें`,
         source: 'local_rules',
       };
     } else {

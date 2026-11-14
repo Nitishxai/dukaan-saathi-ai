@@ -1,4 +1,5 @@
 'use client';
+import { AccessibleDialog } from '../AccessibleDialog';
 
 import React, { useState, useRef } from 'react';
 import {
@@ -144,7 +145,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-150">
+    <AccessibleDialog label="Backup and restore" onClose={onClose} className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-150">
       <div className="relative bg-white rounded-3xl max-w-2xl w-full p-5 sm:p-7 shadow-2xl border border-slate-100 max-h-[92vh] flex flex-col">
         {/* Modal Header */}
         <div className="flex items-center justify-between pb-4 border-b border-slate-100 shrink-0">
@@ -482,6 +483,6 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
           </button>
         </div>
       </div>
-    </div>
+    </AccessibleDialog>
   );
 };

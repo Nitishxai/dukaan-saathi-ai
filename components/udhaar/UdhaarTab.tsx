@@ -77,6 +77,13 @@ export const UdhaarTab: React.FC<UdhaarTabProps> = ({
     return customers.filter((c) => c.currentBalance > 0).length;
   }, [customers]);
 
+  const totalAdvance = useMemo(() => {
+    return customers.reduce(
+      (sum, c) => sum + (c.advanceBalance && c.advanceBalance > 0 ? c.advanceBalance : 0),
+      0
+    );
+  }, [customers]);
+
   // Filtered Customers
   const filteredCustomers = useMemo(() => {
     return customers.filter((c) => {
@@ -254,6 +261,7 @@ export const UdhaarTab: React.FC<UdhaarTabProps> = ({
           </div>
           <div className="text-xs text-slate-500 mt-1">
             {customers.length - pendingCustomersCount} accounts settled
+            {totalAdvance > 0 && ` • ${formatCurrency(totalAdvance)} total advance`}
           </div>
         </div>
       </div>
@@ -346,6 +354,11 @@ export const UdhaarTab: React.FC<UdhaarTabProps> = ({
                       >
                         {formatCurrency(cust.currentBalance)}
                       </div>
+                      {cust.advanceBalance !== undefined && cust.advanceBalance > 0 && (
+                        <div className="text-xs font-bold text-blue-600 mt-0.5">
+                          Advance: {formatCurrency(cust.advanceBalance)}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -434,6 +447,12 @@ export const UdhaarTab: React.FC<UdhaarTabProps> = ({
                   <span className="font-bold text-red-600">
                     {formatCurrency(selectedCustomerForTx.customer.currentBalance)}
                   </span>
+                  {selectedCustomerForTx.customer.advanceBalance !== undefined &&
+                    selectedCustomerForTx.customer.advanceBalance > 0 && (
+                      <span className="ml-2 font-bold text-blue-600">
+                        • Advance: {formatCurrency(selectedCustomerForTx.customer.advanceBalance)}
+                      </span>
+                    )}
                 </p>
               </div>
               <button
@@ -659,6 +678,12 @@ export const UdhaarTab: React.FC<UdhaarTabProps> = ({
                   <span className="font-bold text-red-600">
                     {formatCurrency(ledgerCustomer.currentBalance)}
                   </span>
+                  {ledgerCustomer.advanceBalance !== undefined &&
+                    ledgerCustomer.advanceBalance > 0 && (
+                      <span className="ml-2 font-bold text-blue-600">
+                        • Advance: {formatCurrency(ledgerCustomer.advanceBalance)}
+                      </span>
+                    )}
                 </p>
               </div>
               <button

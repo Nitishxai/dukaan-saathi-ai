@@ -334,14 +334,22 @@ export const InventoryTab: React.FC<InventoryTabProps> = ({
   // Confirm Delete
   const handleConfirmDelete = () => {
     if (!deletingProduct) return;
-    deleteProduct(deletingProduct.id);
+    const res = deleteProduct(deletingProduct.id);
+    if (!res.success) {
+      alert(res.error || 'उत्पाद हटाया नहीं जा सका (Storage write failed)');
+      return;
+    }
     setDeletingProduct(null);
     onRefresh();
   };
 
   // Quick Adjustment
   const handleQuickAdjust = (productId: string, delta: number) => {
-    quickAddStock(productId, delta);
+    const res = quickAddStock(productId, delta);
+    if (!res.success) {
+      alert(res.error || 'स्टॉक अपडेट नहीं हो सका (Storage write failed)');
+      return;
+    }
     onRefresh();
   };
 

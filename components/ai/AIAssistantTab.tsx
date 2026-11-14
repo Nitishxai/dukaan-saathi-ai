@@ -25,16 +25,24 @@ import {
   Globe,
   Edit3,
 } from 'lucide-react';
-import { Customer, Product, Sale, UdhaarTransaction, AIParseResult, AssistantApiResponse, RestockItem } from '../../types';
+import { Customer, Product, Sale, UdhaarTransaction, AIParseResult, AssistantApiResponse, RestockItem, ProductConversationState } from '../../types';
+import {
+  isProductOnboardingTrigger,
+  startProductConversation,
+  processProductConversationTurn,
+  convertDraftToProducts,
+} from '../../lib/product-conversation';
+import { prepareAIDraft, draftSpeech } from '../../lib/ai-draft';
+import { normalizeQuantity } from '../../lib/units';
 import { parseHinglishCommand } from '../../lib/ai-parser';
 import { formatCurrency } from '../../lib/formatters';
 import {
+  getStoreData,
   recordSale,
   recordUdhaarTransaction,
   quickAddStock,
   calculateDailySales,
   saveProductsBatch,
-  roundPrecision,
 } from '../../lib/storage';
 import {
   extractTranscripts,
@@ -92,7 +100,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
   ownerName = 'Shopkeeper',
 }) => {
   const [inputText, setInputText] = useState('');
-  const [aiEngineMode, setAiEngineMode] = useState<'gemini' | 'local'>('gemini');
+  const [aiEngineMode, setAiEngineMode] = useState<'gemini' | 'local'>('local');
   const [voiceStatus, setVoiceStatus] = useState<VoiceAssistantStatus>('idle');
   const [voiceLang, setVoiceLang] = useState<VoiceLanguageCode>('hi-IN');
   const [isMuted, setIsMuted] = useState(false);
@@ -107,15 +115,19 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false);
   const isSubmittingTransactionRef = useRef(false);
-  const [previewResult, setPreviewResult] = useState<AIParseResult | null>(null);
+  const [previewResult, setPreviewResultState] = useState<AIParseResult | null>(null);
+  const setPreviewResult = (result: AIParseResult | null) => setPreviewResultState(result ? prepareAIDraft(result, getStoreData()) : null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [speechErrorNotice, setSpeechErrorNotice] = useState<string | null>(null);
+  const [productConversation, setProductConversation] = useState<ProductConversationState | null>(null);
+  const [quickReplies, setQuickReplies] = useState<string[]>([]);
 
   // References for unmount cleanup and instance management
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const isComponentMounted = useRef(true);
+  const requestController = useRef<AbortController | null>(null);
 
   // Calculate accurate today's sales summary
   const dailySales = useMemo(() => {
@@ -259,21 +271,73 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
 
     setVoiceStatus('thinking');
 
+    // 0. Active Guided Product Onboarding Conversation Turn
+    if (productConversation && productConversation.isActive) {
+      const turn = processProductConversationTurn(productConversation, text, products);
+      if (turn.isCancelled) {
+        setProductConversation(null);
+        setQuickReplies([]);
+        setPreviewResult(null);
+        setVoiceStatus('ready');
+        speakText(turn.aiReply);
+        return;
+      }
+      setProductConversation(turn.nextState);
+      setQuickReplies(turn.quickReplies || []);
+      setVoiceStatus('ready');
+      speakText(turn.aiReply);
+
+      if (turn.nextState.step === 'ready_for_confirmation') {
+        const parsedProducts = convertDraftToProducts(turn.nextState.draft);
+        setPreviewResult({
+          rawText: text,
+          intent: 'inventory_add',
+          intentLabelHindi: 'नया सामान इन्वेंटरी में जोड़ें',
+          confidence: 0.95,
+          parsedProducts,
+          message: turn.aiReply,
+          spokenResponse: turn.aiReply,
+          source: 'local_rules',
+        });
+      }
+      return;
+    }
+
+    // Check if new conversational product onboarding should be triggered
+    if (isProductOnboardingTrigger(text)) {
+      const started = startProductConversation(text, products);
+      setProductConversation(started.state);
+      setQuickReplies(started.quickReplies || []);
+      setVoiceStatus('ready');
+      speakText(started.aiReply);
+
+      if (started.state.step === 'ready_for_confirmation') {
+        const parsedProducts = convertDraftToProducts(started.state.draft);
+        setPreviewResult({
+          rawText: text,
+          intent: 'inventory_add',
+          intentLabelHindi: 'नया सामान इन्वेंटरी में जोड़ें',
+          confidence: 0.95,
+          parsedProducts,
+          message: started.aiReply,
+          spokenResponse: started.aiReply,
+          source: 'local_rules',
+        });
+      }
+      return;
+    }
+
     // Offline / Local Rules Engine
     if (mode === 'local') {
       const result = parseHinglishCommand(text, products, customers, dailySales);
       setPreviewResult(result);
       setVoiceStatus('ready');
 
-      if (result.intent === 'inventory_add') {
-        onRefresh();
-      }
-
       // Speak response if available
       if (result.spokenResponse) {
-        speakText(result.spokenResponse);
+        speakText(draftSpeech(result));
       } else if (result.message) {
-        speakText(result.message);
+        speakText(draftSpeech(result));
       }
       return;
     }
@@ -281,7 +345,11 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
     // Google Gemini API Engine
     setIsLoading(true);
     try {
+      const requestedShopId = getStoreData().profile.id;
+      requestController.current?.abort();
+      requestController.current = new AbortController();
       const response = await fetch('/api/assistant', {
+        signal: AbortSignal.any([requestController.current.signal, AbortSignal.timeout(15000)]),
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -299,6 +367,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
       });
 
       const data: AssistantApiResponse = await response.json();
+      if (!isComponentMounted.current || requestedShopId !== getStoreData().profile.id) return;
 
       if (!response.ok || !data.success || !data.result) {
         const errorMsg =
@@ -310,26 +379,12 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
         setPreviewResult(fallbackResult);
         setVoiceStatus('ready');
 
-        if (fallbackResult.intent === 'inventory_add') {
-          onRefresh();
-        }
-
         if (fallbackResult.spokenResponse) {
-          speakText(fallbackResult.spokenResponse);
+          speakText(draftSpeech(fallbackResult));
         } else if (fallbackResult.message) {
-          speakText(fallbackResult.message);
+          speakText(draftSpeech(fallbackResult));
         }
         return;
-      }
-
-      // Handle Gemini inventory_add auto-save
-      if (
-        data.result.intent === 'inventory_add' &&
-        data.result.parsedProducts &&
-        data.result.parsedProducts.length > 0
-      ) {
-        saveProductsBatch(data.result.parsedProducts);
-        onRefresh();
       }
 
       setPreviewResult(data.result);
@@ -337,11 +392,12 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
 
       // Speak response
       if (data.result.spokenResponse) {
-        speakText(data.result.spokenResponse);
+        speakText(draftSpeech(data.result));
       } else if (data.result.message) {
-        speakText(data.result.message);
+        speakText(draftSpeech(data.result));
       }
     } catch {
+      if (!isComponentMounted.current) return;
       const netMsg =
         'नेटवर्क से संपर्क नहीं हो सका। ऑफलाइन लोकल पार्सर द्वारा उत्तर दिया जा रहा है।';
       setApiError(netMsg);
@@ -351,14 +407,10 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
       setPreviewResult(fallbackResult);
       setVoiceStatus('ready');
 
-      if (fallbackResult.intent === 'inventory_add') {
-        onRefresh();
-      }
-
       if (fallbackResult.spokenResponse) {
-        speakText(fallbackResult.spokenResponse);
+        speakText(draftSpeech(fallbackResult));
       } else if (fallbackResult.message) {
-        speakText(fallbackResult.message);
+        speakText(draftSpeech(fallbackResult));
       }
     } finally {
       setIsLoading(false);
@@ -478,6 +530,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
 
     return () => {
       isComponentMounted.current = false;
+      requestController.current?.abort();
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
@@ -497,7 +550,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
     const res = quickAddStock(item.productId, qty);
     if (res.success) {
       const msg = `नया स्टॉक जोड़ा गया! ${item.productName} में +${qty} ${item.unit}। नया स्टॉक: ${
-        item.currentStock + qty
+        getStoreData().products.find(p => p.id === item.productId)?.currentStock
       } ${item.unit}`;
       setSuccessMessage(msg);
       speakText(`${item.productName} में ${qty} ${item.unit} नया स्टॉक जोड़ दिया गया है।`);
@@ -515,7 +568,17 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
     setIsSubmittingTransaction(true);
 
     try {
-      const { intent, matchedProduct, matchedCustomer, quantity, amount, notes } = previewResult;
+      const { intent, amount, notes } = previewResult;
+      const current = getStoreData();
+      if (previewResult.shopId !== current.profile.id) { setExecutionError('Shop changed. Create a new preview.'); return; }
+      const matchedProduct = current.products.find(p => p.id === previewResult.matchedProduct?.id);
+      const matchedCustomer = current.customers.find(c => c.id === previewResult.matchedCustomer?.id);
+      const quantity = matchedProduct && previewResult.quantity
+        ? normalizeQuantity(previewResult.quantity, previewResult.unit || matchedProduct.unit, matchedProduct.unit)
+        : previewResult.quantity;
+      if (previewResult.matchedProduct && (!matchedProduct || matchedProduct.sellingPrice !== previewResult.matchedProduct.sellingPrice)) {
+        setExecutionError('Product or price changed. Please create a fresh preview.'); return;
+      }
 
       if (intent === 'sale') {
         if (!matchedProduct || !quantity) {
@@ -550,6 +613,8 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
 
         const price = matchedProduct.sellingPrice;
         const res = recordSale({
+          operationId: previewResult.operationId,
+          shopId: previewResult.shopId,
           items: [
             {
               productId: matchedProduct.id,
@@ -570,7 +635,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
           return;
         }
 
-        const newRemainingStock = roundPrecision(matchedProduct.currentStock - quantity, 3);
+        const newRemainingStock = getStoreData().products.find(p => p.id === matchedProduct.id)?.currentStock;
         const successText = `बिक्री सफल! ${matchedProduct.name} (${quantity} ${matchedProduct.unit}) दर्ज कर दिया गया। नया स्टॉक: ${newRemainingStock} ${matchedProduct.unit}`;
         setSuccessMessage(successText);
         speakText(`बिक्री सेव हो गई! ${matchedProduct.name} की सेल दर्ज कर दी गई है।`);
@@ -594,7 +659,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
           return;
         }
 
-        const newBal = roundPrecision(matchedCustomer.currentBalance + amount, 2);
+        const newBal = getStoreData().customers.find(c => c.id === matchedCustomer.id)?.currentBalance;
         const successText = `उधार दर्ज! ${matchedCustomer.name} के खाते में ₹${amount} जोड़ा गया। नया बकाया: ₹${newBal}`;
         setSuccessMessage(successText);
         speakText(`उधार सेव हो गया! ${matchedCustomer.name} के खाते में ${amount} रुपये जोड़ दिए गए हैं।`);
@@ -618,7 +683,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
           return;
         }
 
-        const newBal = roundPrecision(Math.max(0, matchedCustomer.currentBalance - amount), 2);
+        const newBal = getStoreData().customers.find(c => c.id === matchedCustomer.id)?.currentBalance;
         const successText = `जमा दर्ज! ${matchedCustomer.name} से ₹${amount} प्राप्त हुए। नया बकाया: ₹${newBal}`;
         setSuccessMessage(successText);
         speakText(`जमा सेव हो गया! ${matchedCustomer.name} से ${amount} रुपये जमा दर्ज हो गए हैं।`);
@@ -636,14 +701,33 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
           return;
         }
 
-        const currentStock = matchedProduct.currentStock ?? 0;
-        const newTotalStock = roundPrecision(currentStock + quantity, 3);
+        const newTotalStock = getStoreData().products.find(p => p.id === matchedProduct.id)?.currentStock;
         const successText = `नया स्टॉक जोड़ा गया! ${matchedProduct.name} में +${quantity} ${matchedProduct.unit}। नया स्टॉक: ${newTotalStock} ${matchedProduct.unit}`;
         setSuccessMessage(successText);
         speakText(`नया स्टॉक सेव हो गया! ${matchedProduct.name} में स्टॉक जोड़ दिया गया है।`);
+      } else if (intent === 'inventory_add') {
+        if (!previewResult.parsedProducts || previewResult.parsedProducts.length === 0) {
+          setExecutionError('सेव करने के लिए कोई सामान नहीं मिला');
+          setIsSubmittingTransaction(false);
+          return;
+        }
+
+        const res = saveProductsBatch(previewResult.parsedProducts);
+        if (!res.success) {
+          setExecutionError(res.error || 'इन्वेंटरी में सामान सेव नहीं हो सका');
+          setIsSubmittingTransaction(false);
+          return;
+        }
+
+        const savedCount = res.savedProducts.length;
+        const successText = `इन्वेंटरी सेव सफल! ${savedCount} सामान दुकान में सुरक्षित हो गए हैं (${res.addedCount} नया, ${res.updatedCount} अपडेट)।`;
+        setSuccessMessage(successText);
+        speakText(`इन्वेंटरी सेव हो गई! ${savedCount} सामान आपकी दुकान में जोड़ दिए गए हैं।`);
       }
 
       setPreviewResult(null);
+      setProductConversation(null);
+      setQuickReplies([]);
       setInputText('');
       onRefresh();
     } finally {
@@ -652,11 +736,28 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
     }
   };
 
+  // Quick Reply Click Handler for Conversational Onboarding
+  const handleQuickReplyClick = (reply: string) => {
+    if (reply === 'Confirm & Save' || reply === 'कन्फर्म और सेव') {
+      handleConfirmAction();
+      return;
+    }
+    if (reply === 'रद्द करें' || reply === 'Cancel') {
+      setProductConversation(null);
+      setQuickReplies([]);
+      setPreviewResult(null);
+      speakText('सामान जोड़ने की प्रक्रिया रद्द कर दी गई है।');
+      return;
+    }
+    setInputText(reply);
+    handleProcess(reply);
+  };
+
   const isTransactional =
     previewResult &&
     !previewResult.isAmbiguous &&
     !previewResult.errorMessage &&
-    ['sale', 'stock_add', 'udhaar_given', 'udhaar_received'].includes(previewResult.intent);
+    ['sale', 'stock_add', 'udhaar_given', 'udhaar_received', 'inventory_add'].includes(previewResult.intent);
 
   // Status message translation
   const getStatusBadge = () => {
@@ -1065,6 +1166,68 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
           </div>
         </div>
 
+        {/* Active Conversational Onboarding Thread */}
+        {productConversation && productConversation.isActive && (
+          <div className="bg-emerald-50/70 border-2 border-emerald-500 rounded-2xl p-4 text-left space-y-3 animate-in fade-in">
+            <div className="flex items-center justify-between border-b border-emerald-200 pb-2">
+              <div className="flex items-center space-x-2">
+                <Sparkles className="w-4 h-4 text-emerald-700" />
+                <span className="font-bold text-xs text-emerald-900">
+                  Guided Product Onboarding (नया सामान जोड़ें)
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleQuickReplyClick('Cancel')}
+                className="text-[11px] font-semibold text-red-600 hover:text-red-800"
+              >
+                रद्द करें (Cancel)
+              </button>
+            </div>
+
+            {/* Conversation History */}
+            <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+              {productConversation.history.map((h, i) => (
+                <div
+                  key={i}
+                  className={`flex ${h.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`max-w-[85%] rounded-xl px-3 py-1.5 text-xs ${
+                      h.role === 'user'
+                        ? 'bg-emerald-600 text-white font-medium'
+                        : 'bg-white border border-emerald-200 text-slate-800 shadow-2xs'
+                    }`}
+                  >
+                    {h.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Quick Reply Pills */}
+            {quickReplies.length > 0 && (
+              <div className="pt-2 border-t border-emerald-200/80">
+                <div className="text-[11px] font-semibold text-emerald-800 mb-1.5">
+                  त्वरित विकल्प (टैप करें):
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {quickReplies.map((q, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => handleQuickReplyClick(q)}
+                      className="px-3 py-1 rounded-lg bg-white hover:bg-emerald-100 border border-emerald-300 text-xs font-bold text-emerald-800 shadow-2xs transition active:scale-95 cursor-pointer"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Suggestion Chips */}
         <div>
           <div className="text-xs font-semibold text-slate-500 mb-2">
@@ -1277,107 +1440,7 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
         </div>
       )}
 
-      {/* 8.5 AUTO-SAVED INVENTORY BATCH DISPLAY */}
-      {previewResult && previewResult.intent === 'inventory_add' && (
-        <div className="bg-white rounded-2xl border-2 border-emerald-500 p-5 shadow-lg space-y-4 animate-in zoom-in-95">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-            <div className="flex items-center space-x-2">
-              <span className="p-1.5 bg-emerald-100 text-emerald-800 rounded-lg">
-                <Package className="w-4 h-4" />
-              </span>
-              <div>
-                <h3 className="font-bold text-slate-900 text-base">
-                  Auto-Saved Products
-                </h3>
-                <p className="text-xs text-slate-500">
-                  {previewResult.source === 'gemini'
-                    ? '✨ Saved to inventory via Gemini AI'
-                    : '⚡ Immediately saved to inventory'}
-                </p>
-              </div>
-            </div>
-            <button
-              onClick={() => setPreviewResult(null)}
-              className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
 
-          {previewResult.message && (
-            <p className="text-xs text-slate-700 bg-emerald-50/70 p-3 rounded-xl border border-emerald-200 leading-relaxed">
-              {previewResult.message}
-            </p>
-          )}
-
-          {previewResult.parsedProducts && previewResult.parsedProducts.length > 0 && (
-            <div className="space-y-2.5">
-              <div className="text-xs font-bold text-slate-700">Recorded Products:</div>
-              <div className="grid gap-2.5">
-                {previewResult.parsedProducts.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                  >
-                    <div>
-                      <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
-                        <span>{item.name}</span>
-                        <span className="text-[11px] font-normal px-2 py-0.5 bg-slate-200 text-slate-800 rounded-full">
-                          {item.unit}
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-3 mt-1.5 text-slate-600">
-                        <span>
-                          Opening Stock:{' '}
-                          <strong className="text-slate-800">
-                            {item.openingStock !== null && item.openingStock !== undefined
-                              ? `${item.openingStock} ${item.unit}`
-                              : 'Unrecorded'}
-                          </strong>
-                        </span>
-                        <span>•</span>
-                        <span>
-                          Selling Price:{' '}
-                          <strong className="text-slate-800">
-                            {item.sellingPrice !== null && item.sellingPrice !== undefined
-                              ? `₹${item.sellingPrice}`
-                              : 'Not set'}
-                          </strong>
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-1.5 self-end sm:self-auto">
-                      {item.openingStock === null || item.sellingPrice === null ? (
-                        <span className="text-[11px] px-2 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md font-medium">
-                          ⚠️ Details needed
-                        </span>
-                      ) : (
-                        <span className="text-[11px] px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md font-semibold">
-                          ✓ Complete details
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {onNavigateToTab && (
-            <div className="pt-2 flex justify-end">
-              <button
-                type="button"
-                onClick={() => onNavigateToTab('inventory')}
-                className="text-xs font-bold text-emerald-700 hover:text-emerald-900 flex items-center gap-1 cursor-pointer"
-              >
-                <span>View all items in Inventory</span>
-                <ArrowRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* 9. AMBIGUOUS OR CLARIFICATION NEEDED DISPLAY */}
       {previewResult &&
@@ -1475,6 +1538,81 @@ export const AIAssistantTab: React.FC<AIAssistantTabProps> = ({
 
             {/* Parsed Details Table */}
             <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200 text-xs space-y-2">
+              {previewResult.intent === 'inventory_add' && previewResult.parsedProducts && (
+                <div className="space-y-2">
+                  <div className="text-xs font-bold text-slate-800 flex items-center justify-between pb-1 border-b border-slate-200">
+                    <span>सामान जिन्हें इन्वेंटरी में जोड़ा/अपडेट किया जाएगा:</span>
+                    <span className="text-emerald-700 font-extrabold">{previewResult.parsedProducts.length} सामान</span>
+                  </div>
+                  <div className="grid gap-2 max-h-60 overflow-y-auto">
+                    {previewResult.parsedProducts.map((item, idx) => (
+                      <div
+                        key={idx}
+                        className="p-2.5 bg-white border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                      >
+                        <div>
+                          <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                            <span>{item.name}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded-md font-semibold">
+                              {item.unit}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-1 text-[11px] text-slate-600">
+                            <span>
+                              Opening Stock:{' '}
+                              <strong className="text-slate-800">
+                                {item.openingStock !== null && item.openingStock !== undefined
+                                  ? `${item.openingStock} ${item.unit}`
+                                  : 'दर्ज नहीं'}
+                              </strong>
+                            </span>
+                            <span>•</span>
+                            <span>
+                              Selling Price:{' '}
+                              <strong className="text-slate-800">
+                                {item.sellingPrice !== null && item.sellingPrice !== undefined
+                                  ? `₹${item.sellingPrice}`
+                                  : 'दर्ज नहीं'}
+                              </strong>
+                            </span>
+                            {item.size && (
+                              <>
+                                <span>•</span>
+                                <span>Size: <strong className="text-slate-800">{item.size}</strong></span>
+                              </>
+                            )}
+                            {item.color && (
+                              <>
+                                <span>•</span>
+                                <span>Color: <strong className="text-slate-800">{item.color}</strong></span>
+                              </>
+                            )}
+                            {item.sku && (
+                              <>
+                                <span>•</span>
+                                <span>SKU: <strong className="font-mono text-slate-800">{item.sku}</strong></span>
+                              </>
+                            )}
+                            {item.barcode && (
+                              <>
+                                <span>•</span>
+                                <span>Barcode: <strong className="font-mono text-slate-800">{item.barcode}</strong></span>
+                              </>
+                            )}
+                            {item.purchasePrice !== null && item.purchasePrice !== undefined && (
+                              <>
+                                <span>•</span>
+                                <span>Purchase: <strong className="text-slate-800">₹{item.purchasePrice}</strong></span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {previewResult.matchedProduct && (
                 <div className="flex justify-between items-center py-1 border-b border-slate-200/60">
                   <span className="text-slate-500 font-medium flex items-center gap-1.5">

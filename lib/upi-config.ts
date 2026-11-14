@@ -25,7 +25,7 @@ import { ShopProfile } from '../types';
 
 export const STATIC_QR_IMAGE_PATH = '/shop-upi-qr.png';
 export const DEFAULT_FALLBACK_UPI_ID =
-  process.env.NEXT_PUBLIC_SHOP_UPI_ID || 'dukaan.store@upi';
+  process.env.NEXT_PUBLIC_SHOP_UPI_ID || '';
 
 /**
  * Resolves the active UPI ID for the shop.
@@ -55,7 +55,8 @@ export function buildUpiPaymentUri(params: {
   const { upiId, payeeName, amount, transactionNote } = params;
   const cleanUpiId = upiId.trim();
   const cleanPayee = (payeeName || 'Store Merchant').trim();
-  const formattedAmount = Math.max(0, amount).toFixed(2);
+  if (!/^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+$/.test(cleanUpiId) || !Number.isFinite(amount) || amount <= 0) return '';
+  const formattedAmount = amount.toFixed(2);
   const note = (transactionNote || `Bill at ${cleanPayee}`).trim();
 
   const queryParams = new URLSearchParams({

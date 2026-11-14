@@ -8,6 +8,7 @@ import {
   resetCurrentShopToEmpty,
   getStockClassification,
   INITIAL_EMPTY_DATA,
+  getRecoveryError,
 } from '../lib/storage';
 import { Header } from '../components/layout/Header';
 import { Navigation, TabType } from '../components/layout/Navigation';
@@ -20,15 +21,12 @@ import { AIAssistantTab } from '../components/ai/AIAssistantTab';
 import { ShopOnboardingModal } from '../components/profile/ShopOnboardingModal';
 import { ProfileSwitcherModal } from '../components/profile/ProfileSwitcherModal';
 import { BackupRestoreModal } from '../components/backup/BackupRestoreModal';
+import { RecoveryPanel } from '../components/RecoveryPanel';
+import { initialWriterMessage, localWriterMessage, subscribeLocalWriter } from '../lib/local-writer';
 import { RotateCcw } from 'lucide-react';
 
-export default function Home() {
-  const storeData = useSyncExternalStore(
-    subscribeStoreData,
-    getStoreData,
-    () => INITIAL_EMPTY_DATA
-  );
-
+function ShopWorkspace({ storeData }: { storeData: ReturnType<typeof getStoreData> }) {
+  const writerMessage = useSyncExternalStore(subscribeLocalWriter, localWriterMessage, initialWriterMessage);
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [isStorageModalOpen, setIsStorageModalOpen] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
@@ -46,9 +44,10 @@ export default function Home() {
   // Reset logic respects whether active store is demo or real
   const handleConfirmReset = () => {
     if (storeData.profile?.isDemo) {
-      resetToDemoData();
+      try { resetToDemoData(); } catch { window.alert('Demo reset nahi hua. Storage aur doosre tab ki jaanch karein.'); return; }
     } else {
-      resetCurrentShopToEmpty();
+      const result = resetCurrentShopToEmpty();
+      if (!result.success) { window.alert(result.error); return; }
     }
     setIsResetConfirmOpen(false);
   };
@@ -65,6 +64,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-800">
+      {writerMessage && <p role="status" className="p-3 bg-amber-100 text-amber-950">{writerMessage}</p>}
       {/* Top Header */}
       <Header
         storeData={storeData}
@@ -218,4 +218,11 @@ export default function Home() {
       )}
     </div>
   );
+}
+
+export default function Home() {
+  const data = useSyncExternalStore(subscribeStoreData, getStoreData, () => INITIAL_EMPTY_DATA);
+  const recovery = useSyncExternalStore(subscribeStoreData, getRecoveryError, () => null);
+  if (recovery) return <RecoveryPanel message={recovery} />;
+  return <ShopWorkspace key={data.profile.id} storeData={data} />;
 }

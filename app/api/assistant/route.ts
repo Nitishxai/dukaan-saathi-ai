@@ -1,3 +1,6 @@
+import { pilotDatabase, requireSameOrigin, sessionToken, boundedJson } from '../../../lib/server/http';
+import { PilotError } from '../../../lib/server/database';
+import { calculateDailySales } from '../../../lib/storage';
 import { NextRequest, NextResponse } from 'next/server';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
@@ -67,6 +70,11 @@ function cleanTextForSpeech(text: string): string {
 
 export async function POST(req: NextRequest): Promise<NextResponse<AssistantApiResponse>> {
   try {
+    if (process.env.AI_ENABLED !== 'true') return NextResponse.json({ success:false, error:'AI_DISABLED', message:'Online AI disabled. Local draft assistant remains available.' }, {status:503});
+    const db=pilotDatabase();requireSameOrigin(req);const user=db.authenticate(sessionToken(req));
+    const budget=Number(process.env.AI_DAILY_REQUEST_LIMIT||0);
+    if(!Number.isSafeInteger(budget)||budget<1||budget>1000)throw new PilotError('AI usage budget is not configured',503);
+    db.limit('ai-user:'+user,10);db.limit('ai-global-day',budget,86_400_000);
     // 1. Check Server-Side Environment Variables
     const apiKey = process.env.GEMINI_API_KEY;
 
@@ -86,7 +94,7 @@ export async function POST(req: NextRequest): Promise<NextResponse<AssistantApiR
     // 2. Validate Request Body
     let body: AssistantApiRequest;
     try {
-      body = await req.json();
+      body = await boundedJson(req) as unknown as AssistantApiRequest;
     } catch {
       return NextResponse.json(
         {
@@ -98,6 +106,10 @@ export async function POST(req: NextRequest): Promise<NextResponse<AssistantApiR
       );
     }
 
+    if(typeof body.shopId!=='string')throw new PilotError('Select an authenticated server shop',403);
+    const shop=db.read(user,body.shopId);
+    const summary=calculateDailySales(shop.sales,shop.udhaarTransactions);
+    body={message:body.message,inventory:shop.products.slice(0,500),customers:shop.customers.slice(0,500),shopName:shop.shopName,ownerName:shop.shopkeeperName,todaySalesTotal:summary.grossSales,todaySalesCount:summary.completedSalesCount,todaySalesSummary:summary};
     const {
       message,
       inventory = [],
@@ -310,13 +322,9 @@ ${JSON.stringify(customersContext, null, 2)}
     };
 
     // 7. Call Gemini Models API with automatic model resiliency
-    const configuredModel = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-    const candidateModels = Array.from(
-      new Set([
-        configuredModel,
-        configuredModel === 'gemini-3.6-flash' ? 'gemini-3.8-flash' : 'gemini-3.6-flash',
-      ])
-    );
+    const configuredModel = process.env.GEMINI_MODEL;
+    if(!configuredModel)throw new PilotError('Set an explicitly supported Gemini model',503);
+    const candidateModels = [configuredModel];
 
     let response;
     let lastError: unknown;
@@ -332,6 +340,8 @@ ${JSON.stringify(customersContext, null, 2)}
             },
           ],
           config: {
+            abortSignal: AbortSignal.timeout(10000),
+            maxOutputTokens: 1500,
             responseMimeType: 'application/json',
             responseSchema,
             temperature: 0.1,
@@ -561,7 +571,8 @@ ${JSON.stringify(customersContext, null, 2)}
     const errorObj = err as { message?: string; status?: number } | undefined;
     const errorMessage = errorObj?.message || 'Unknown error';
 
-    console.error('Gemini API assistant error:', errorMessage);
+    if(err instanceof PilotError)return NextResponse.json({success:false,error:err.message},{status:err.status});
+    console.error('AI request failed; provider details withheld.');
 
     const isQuotaOrRateLimit =
       errorMessage.includes('429') ||

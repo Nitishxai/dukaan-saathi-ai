@@ -1,4 +1,5 @@
 'use client';
+import { AccessibleDialog } from '../AccessibleDialog';
 
 import React, { useState } from 'react';
 import {
@@ -64,9 +65,11 @@ export const ProfileSwitcherModal: React.FC<ProfileSwitcherModalProps> = ({
   if (!isOpen) return null;
 
   const handleSelectProfile = (id: string) => {
-    switchProfile(id);
-    onRefresh();
-    onClose();
+    try {
+      const selected = switchProfile(id);
+      if (selected.profile.id !== id) { setErrorMessage('Shop switch failed. Close other counter tabs and retry.'); return; }
+      onRefresh(); onClose();
+    } catch { setErrorMessage('Shop switch could not be saved. Please retry.'); }
   };
 
   const handleStartEdit = (e: React.MouseEvent) => {
@@ -168,7 +171,7 @@ export const ProfileSwitcherModal: React.FC<ProfileSwitcherModalProps> = ({
   };
 
   const handleLoadDemo = () => {
-    loadDemoShop();
+    try { loadDemoShop(); } catch { setErrorMessage('Demo nahi khula. Storage aur doosre tab ki jaanch karein.'); return; }
     setProfiles(getProfilesList());
     onRefresh();
     onClose();
@@ -183,7 +186,7 @@ export const ProfileSwitcherModal: React.FC<ProfileSwitcherModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
+    <AccessibleDialog label="Shop profiles" onClose={onClose} className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
       <div className="relative bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-100 space-y-5">
         {/* Modal Header */}
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
@@ -523,6 +526,6 @@ export const ProfileSwitcherModal: React.FC<ProfileSwitcherModalProps> = ({
           </form>
         )}
       </div>
-    </div>
+    </AccessibleDialog>
   );
 };

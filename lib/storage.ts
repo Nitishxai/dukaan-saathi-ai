@@ -1,12 +1,14 @@
+import { validateBackupRecords } from './validation.ts';
+import { applySale, type SaleInput } from './accounting.ts';
+import { canWriteLocalStore, acquireLocalWriter } from './local-writer.ts';
 import type {
   DukaanStoreData,
   ShopProfile,
   Product,
   Sale,
-  SaleItem,
   Customer,
   UdhaarTransaction,
-  PaymentMode,
+  PaymentVerificationStatus,
   UdhaarType,
   UnitType,
   StockStatusClassification,
@@ -21,6 +23,8 @@ const PROFILE_DATA_KEY_PREFIX = 'dukaan_store_data_';
 const LEGACY_STORAGE_KEY = 'dukaan_sathi_store_v1';
 
 export const STORAGE_UPDATE_EVENT = 'dukaan_sathi_store_updated_v2';
+export const STORAGE_FAILURE_ERROR_MESSAGE =
+  'डिवाइस स्टोरेज में डेटा सुरक्षित नहीं हो सका (मेमोरी फुल या परमिशन एरर)। कृपया बैकअप डाउनलोड करें या स्पेस खाली करें। (Device storage write failed)';
 
 // Standard demo profile ID
 export const DEMO_PROFILE_ID = 'profile-demo-kirana';
@@ -42,7 +46,7 @@ export function createEmptyShopData(profile: ShopProfile): DukaanStoreData {
     stockMovements: [],
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'profile_update',
         title: 'Shop Account Initialized',
         description: `${profile.shopName}'s digital ledger is ready. Add your first products.`,
@@ -163,6 +167,7 @@ export const SAMPLE_DEMO_STORE_DATA: DukaanStoreData = {
       phone: '98765 43210',
       address: 'मकान नं. 14, गली नं. 2',
       currentBalance: 1250,
+      advanceBalance: 0,
       lastTransactionAt: '2026-10-12T11:00:00.000Z',
       createdAt: '2026-10-10T10:00:00.000Z',
     },
@@ -172,6 +177,7 @@ export const SAMPLE_DEMO_STORE_DATA: DukaanStoreData = {
       phone: '98112 23344',
       address: 'सामने वाली कोठी',
       currentBalance: 480,
+      advanceBalance: 0,
       lastTransactionAt: '2026-10-12T09:00:00.000Z',
       createdAt: '2026-10-10T10:00:00.000Z',
     },
@@ -279,6 +285,25 @@ export const INITIAL_DEMO_DATA: DukaanStoreData = INITIAL_EMPTY_DATA;
 // ---------------- IN-MEMORY SNAPSHOT & SUBSCRIBERS ----------------
 let cachedSnapshot: DukaanStoreData = INITIAL_EMPTY_DATA;
 let isInitialized = false;
+let recoveryError: string | null = null;
+export function getRecoveryError(): string | null { return recoveryError; }
+export function downloadRecoveryBytes(): void {
+  const content: Record<string, string> = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key?.startsWith('dukaan_')) content[key] = localStorage.getItem(key)!;
+  }
+  const url = URL.createObjectURL(new Blob([JSON.stringify(content)], { type: 'application/json' }));
+  const link = document.createElement('a'); link.href = url; link.download = 'dukaan-recovery-originals.json'; link.click(); URL.revokeObjectURL(url);
+}
+export function preserveRecoverySnapshot(): boolean {
+  try {
+    const id = getStoreData().profile.id;
+    const raw = localStorage.getItem(getProfileStorageKey(id));
+    if (raw) localStorage.setItem('dukaan_recovery_' + id + '_' + Date.now(), raw);
+    return true;
+  } catch { return false; }
+}
 
 const subscribers = new Set<() => void>();
 
@@ -296,10 +321,26 @@ function getProfileStorageKey(profileId: string): string {
   return `${PROFILE_DATA_KEY_PREFIX}${profileId}_v2`;
 }
 
+function parseSavedShop(raw:string, expectedId?:string):DukaanStoreData {
+  const parsed=JSON.parse(raw) as DukaanStoreData;
+  if(!parsed || (expectedId && parsed.profile?.id!==expectedId))throw new Error('Shop identity mismatch');
+  const error=validateBackupRecords({shopProfile:parsed.profile,data:parsed,exportedAt:new Date().toISOString()});
+  if(error)throw new Error(error);
+  if(parsed.revision!==undefined && (!Number.isSafeInteger(parsed.revision)||parsed.revision<0))throw new Error('Invalid revision');
+  return parsed;
+}
 // ---------------- PROFILE INITIALIZATION & MIGRATION ----------------
 function initClientSnapshot(): void {
   if (typeof window === 'undefined' || isInitialized) return;
   isInitialized = true;
+  if (!canWriteLocalStore()) {
+    try {
+      const id = localStorage.getItem(ACTIVE_PROFILE_KEY);
+      const raw = id && localStorage.getItem(getProfileStorageKey(id));
+      if (raw) cachedSnapshot = parseSavedShop(raw,id||undefined);
+    } catch { recoveryError = 'Saved shop requires recovery.'; }
+    return;
+  }
 
   try {
     // 1. Check active profile ID
@@ -311,69 +352,22 @@ function initClientSnapshot(): void {
       try {
         profilesList = JSON.parse(profilesIndexRaw);
       } catch {
-        profilesList = [];
+        recoveryError = 'Shop index is damaged. Original data has been preserved.';
+        return;
       }
     }
 
-    // 2. Migration Check from legacy v1 storage
-    if (profilesList.length === 0) {
-      const legacyRaw = localStorage.getItem(LEGACY_STORAGE_KEY);
-      if (legacyRaw) {
-        try {
-          const legacy = JSON.parse(legacyRaw);
-          // If legacy data had items, migrate it into a preserved profile
-          if (legacy && Array.isArray(legacy.products) && legacy.products.length > 0) {
-            const isUntouchedDemo =
-              legacy.shopName === 'श्री गणेश किराना एवं जनरल स्टोर' &&
-              legacy.products.length === 12;
-
-            if (isUntouchedDemo) {
-              // Untouched demo: start with clean un-onboarded profile
-              const mainProfile: ShopProfile = { ...DEFAULT_INITIAL_PROFILE, isOnboarded: false };
-              profilesList = [mainProfile];
-              activeProfileId = mainProfile.id;
-              cachedSnapshot = createEmptyShopData(mainProfile);
-              saveProfileDataDirect(mainProfile.id, cachedSnapshot);
-            } else {
-              // User had customized their store: preserve their data!
-              const migratedProfile: ShopProfile = {
-                id: 'profile-migrated-1',
-                shopName: legacy.shopName || 'मेरी दुकान',
-                ownerName: legacy.shopkeeperName || 'दुकानदार',
-                category: 'किराना स्टोर (Kirana Store)',
-                phone: legacy.phone || '',
-                createdAt: new Date().toISOString(),
-                isOnboarded: true,
-              };
-              profilesList = [migratedProfile];
-              activeProfileId = migratedProfile.id;
-              cachedSnapshot = {
-                profile: migratedProfile,
-                shopName: migratedProfile.shopName,
-                shopkeeperName: migratedProfile.ownerName,
-                phone: migratedProfile.phone || '',
-                products: legacy.products.map((p: Product) => ({
-                  ...p,
-                  currentStock: typeof p.currentStock === 'number' ? p.currentStock : null,
-                  sellingPrice: typeof p.sellingPrice === 'number' ? p.sellingPrice : null,
-                  minStockAlert: p.minStockAlert || 5,
-                })),
-                sales: legacy.sales || [],
-                customers: legacy.customers || [],
-                udhaarTransactions: legacy.udhaarTransactions || [],
-                stockMovements: [],
-                activities: legacy.activities || [],
-                lastResetAt: legacy.lastResetAt || new Date().toISOString(),
-              };
-              saveProfileDataDirect(migratedProfile.id, cachedSnapshot);
-            }
-          }
-        } catch (e) {
-          console.warn('Could not parse legacy data for migration:', e);
-        }
-      }
+    // Legacy imports require review; never silently migrate or discard real data.
+    if (profilesList.length === 0 && localStorage.getItem(LEGACY_STORAGE_KEY)) {
+      recoveryError = 'Legacy shop found. Export original data and review a backup before importing.';
+      return;
     }
-
+    if (!Array.isArray(profilesList) || profilesList.some(p => !p || typeof p.id !== 'string' || !p.id)) {
+      recoveryError = 'Shop index is invalid. Original bytes were preserved.'; return;
+    }
+    if (profilesList.length === 0 && localStorage.getItem(getProfileStorageKey(DEFAULT_INITIAL_PROFILE.id))) {
+      recoveryError = 'Shop records exist without an index. Recovery is required.'; return;
+    }
     // 3. If still empty, create default un-onboarded profile
     if (profilesList.length === 0) {
       const initialProfile = { ...DEFAULT_INITIAL_PROFILE };
@@ -398,7 +392,7 @@ function initClientSnapshot(): void {
     }
     if (rawActiveData) {
       try {
-        const parsedData = JSON.parse(rawActiveData);
+        const parsedData = parseSavedShop(rawActiveData,activeProfileId);
         if (parsedData && Array.isArray(parsedData.products)) {
           cachedSnapshot = {
             ...parsedData,
@@ -410,23 +404,28 @@ function initClientSnapshot(): void {
           };
           return;
         }
-      } catch (err) {
-        console.error('Error parsing active profile store data:', err);
+      } catch {
+        recoveryError = 'Saved shop data is damaged. Download original bytes and restore a validated backup.';
+        console.error('Saved shop requires recovery');
+        return;
       }
     }
 
+    if (rawActiveData) { recoveryError = 'Saved shop schema is invalid. Recovery is required.'; return; }
     // Fallback if active data file was missing
     const activeProf = profilesList.find((p) => p.id === activeProfileId) || profilesList[0];
     cachedSnapshot = createEmptyShopData(activeProf);
     saveProfileDataDirect(activeProf.id, cachedSnapshot);
-  } catch (err) {
-    console.error('Failed to init storage snapshot:', err);
+  } catch {
+    console.error('Storage initialization failed');
+    recoveryError = 'Storage cannot be read or initialized. No new entries are allowed.';
     cachedSnapshot = INITIAL_EMPTY_DATA;
   }
 }
 
 function saveProfileDataDirect(profileId: string, data: DukaanStoreData): void {
   if (typeof window === 'undefined') return;
+  if (!canWriteLocalStore()) throw new Error('Another tab owns the counter');
   localStorage.setItem(getProfileStorageKey(profileId), JSON.stringify(data));
 }
 
@@ -434,6 +433,7 @@ function saveProfileDataDirect(profileId: string, data: DukaanStoreData): void {
 
 export function __resetStorageForTesting(): void {
   isInitialized = false;
+  recoveryError = null;
   cachedSnapshot = INITIAL_EMPTY_DATA;
   subscribers.clear();
 }
@@ -449,8 +449,11 @@ export function getStoreData(): DukaanStoreData {
 }
 
 export function saveStoreData(data: DukaanStoreData): boolean {
+  if (recoveryError || !canWriteLocalStore()) return false;
+  if (validateBackupRecords({ shopProfile: data.profile, data, exportedAt: new Date().toISOString() })) return false;
   const nextSnapshot: DukaanStoreData = {
     ...data,
+    revision: (data.revision ?? 0) + 1,
     shopName: data.profile?.shopName || data.shopName,
     shopkeeperName: data.profile?.ownerName || data.shopkeeperName,
     phone: data.profile?.phone || data.phone || '',
@@ -459,6 +462,9 @@ export function saveStoreData(data: DukaanStoreData): boolean {
   if (typeof window !== 'undefined') {
     try {
       const activeProfileId = data.profile?.id || localStorage.getItem(ACTIVE_PROFILE_KEY) || 'profile-main';
+      const raw = localStorage.getItem(getProfileStorageKey(activeProfileId));
+      if (raw && (JSON.parse(raw).revision ?? 0) !== (data.revision ?? 0)) return false;
+      if (activeProfileId !== localStorage.getItem(ACTIVE_PROFILE_KEY)) return false;
       // Atomic write: serialize & save to disk before updating in-memory cache
       saveProfileDataDirect(activeProfileId, nextSnapshot);
 
@@ -494,6 +500,7 @@ export function saveStoreData(data: DukaanStoreData): boolean {
 
 export function subscribeStoreData(onStoreChange: () => void): () => void {
   subscribers.add(onStoreChange);
+  acquireLocalWriter(() => { isInitialized = false; initClientSnapshot(); cachedSnapshot = { ...cachedSnapshot }; notifySubscribers(); });
 
   const handleCustomEvent = () => {
     onStoreChange();
@@ -506,20 +513,21 @@ export function subscribeStoreData(onStoreChange: () => void): () => void {
 
     if (event.key === getProfileStorageKey(currentActiveId) && event.newValue) {
       try {
-        const parsed = JSON.parse(event.newValue);
+        const parsed = parseSavedShop(event.newValue,currentActiveId);
         if (parsed && Array.isArray(parsed.products)) {
           cachedSnapshot = parsed;
           onStoreChange();
         }
-      } catch (e) {
-        console.error('Error handling storage event:', e);
+      } catch {
+        recoveryError='Another tab wrote invalid shop data. Original bytes preserved.';
+        cachedSnapshot={...cachedSnapshot};onStoreChange();
       }
     } else if (event.key === ACTIVE_PROFILE_KEY && event.newValue) {
       // Switched profiles in another tab
       const raw = localStorage.getItem(getProfileStorageKey(event.newValue));
       if (raw) {
         try {
-          cachedSnapshot = JSON.parse(raw);
+          cachedSnapshot = parseSavedShop(raw,event.newValue);
           onStoreChange();
         } catch {
           // ignore
@@ -564,7 +572,7 @@ export function getActiveProfile(): ShopProfile {
 }
 
 export function switchProfile(profileId: string): DukaanStoreData {
-  if (typeof window === 'undefined') return cachedSnapshot;
+  if (typeof window === 'undefined' || !canWriteLocalStore()) return cachedSnapshot;
 
   const profiles = getProfilesList();
   const targetProfile = profiles.find((p) => p.id === profileId);
@@ -581,7 +589,7 @@ export function switchProfile(profileId: string): DukaanStoreData {
   }
   if (raw) {
     try {
-      const parsed = JSON.parse(raw);
+      const parsed = parseSavedShop(raw,profileId);
       cachedSnapshot = {
         ...parsed,
         profile: targetProfile,
@@ -590,8 +598,9 @@ export function switchProfile(profileId: string): DukaanStoreData {
         phone: targetProfile.phone || '',
       };
     } catch {
-      cachedSnapshot = createEmptyShopData(targetProfile);
-      saveProfileDataDirect(profileId, cachedSnapshot);
+      recoveryError = "Saved shop is damaged. Download original bytes before recovery.";
+      notifySubscribers();
+      return cachedSnapshot;
     }
   } else {
     cachedSnapshot = createEmptyShopData(targetProfile);
@@ -627,16 +636,13 @@ export function createShopProfile(
   const currentProfiles = getProfilesList();
   const updatedProfiles = [...currentProfiles, newProfile];
 
-  if (typeof window !== 'undefined') {
+  try {
+    const newStoreData = createEmptyShopData(newProfile);
+    saveProfileDataDirect(id, newStoreData);
     localStorage.setItem(PROFILES_INDEX_KEY, JSON.stringify(updatedProfiles));
-  }
-
-  const newStoreData = createEmptyShopData(newProfile);
-  saveProfileDataDirect(id, newStoreData);
-
-  // Switch to newly created profile
-  switchProfile(id);
-  return { success: true, profile: newProfile };
+    switchProfile(id);
+    return { success: true, profile: newProfile };
+  } catch { return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE }; }
 }
 
 export function updateShopProfile(
@@ -658,7 +664,7 @@ export function updateShopProfile(
     phone: updatedProfile.phone || '',
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'profile_update',
         title: 'प्रोफाइल अपडेट (Profile Updated)',
         description: `${updatedProfile.shopName} • ${updatedProfile.ownerName}`,
@@ -668,7 +674,10 @@ export function updateShopProfile(
     ],
   };
 
-  saveStoreData(updatedData);
+  const saved = saveStoreData(updatedData);
+  if (!saved) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, profile: updatedProfile };
 }
 
@@ -677,39 +686,45 @@ export function updateShopProfile(
  * This guarantees sample products never contaminate real shops.
  */
 export function loadDemoShop(): DukaanStoreData {
+  if (!canWriteLocalStore() || recoveryError) throw new Error(STORAGE_FAILURE_ERROR_MESSAGE);
   const profiles = getProfilesList();
-  let demoProfile = profiles.find((p) => p.id === DEMO_PROFILE_ID);
-
-  if (!demoProfile) {
-    demoProfile = { ...SAMPLE_DEMO_STORE_DATA.profile };
-    const updatedProfiles = [...profiles, demoProfile];
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(PROFILES_INDEX_KEY, JSON.stringify(updatedProfiles));
-    }
+  const existing = localStorage.getItem(getProfileStorageKey(DEMO_PROFILE_ID))
+    ?? localStorage.getItem(PROFILE_DATA_KEY_PREFIX + DEMO_PROFILE_ID);
+  if (existing !== null) parseSavedShop(existing, DEMO_PROFILE_ID);
+  else {
+    if (profiles.some(profile => profile.id === DEMO_PROFILE_ID)) throw new Error('Demo shop data is missing.');
+    saveProfileDataDirect(DEMO_PROFILE_ID, SAMPLE_DEMO_STORE_DATA);
   }
-
-  saveProfileDataDirect(DEMO_PROFILE_ID, SAMPLE_DEMO_STORE_DATA);
+  if (!profiles.some(profile => profile.id === DEMO_PROFILE_ID)) {
+    localStorage.setItem(PROFILES_INDEX_KEY, JSON.stringify([...profiles, SAMPLE_DEMO_STORE_DATA.profile]));
+  }
   return switchProfile(DEMO_PROFILE_ID);
 }
 
 /**
  * Resets the current shop's data to a clean empty state.
  */
-export function resetCurrentShopToEmpty(): DukaanStoreData {
+export function resetCurrentShopToEmpty(): { success: boolean; error?: string } {
   const current = getStoreData();
   const empty = createEmptyShopData({
     ...current.profile,
     isOnboarded: current.profile.isOnboarded,
   });
-  saveStoreData(empty);
-  return empty;
+  empty.revision = current.revision;
+  if (!preserveRecoverySnapshot() || !saveStoreData(empty)) return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  return { success: true };
 }
 
 /**
  * Backward compatibility alias for resetting to demo shop
  */
 export function resetToDemoData(): DukaanStoreData {
-  return loadDemoShop();
+  const current = getStoreData();
+  if (current.profile.id !== DEMO_PROFILE_ID || !preserveRecoverySnapshot() ||
+      !saveStoreData({ ...SAMPLE_DEMO_STORE_DATA, revision: current.revision })) {
+    throw new Error(STORAGE_FAILURE_ERROR_MESSAGE);
+  }
+  return getStoreData();
 }
 
 // ---------------- STOCK CLASSIFICATION HELPER ----------------
@@ -763,25 +778,25 @@ export function addProduct(
 
   // Validate prices & quantities
   if (productInput.sellingPrice !== undefined && productInput.sellingPrice !== null) {
-    if (typeof productInput.sellingPrice !== 'number' || isNaN(productInput.sellingPrice) || productInput.sellingPrice <= 0) {
+    if (typeof productInput.sellingPrice !== 'number' || !Number.isFinite(productInput.sellingPrice) || productInput.sellingPrice <= 0) {
       return { success: false, error: 'Selling price must be greater than zero.' };
     }
   }
 
   if (productInput.currentStock !== undefined && productInput.currentStock !== null) {
-    if (typeof productInput.currentStock !== 'number' || isNaN(productInput.currentStock) || productInput.currentStock < 0) {
+    if (typeof productInput.currentStock !== 'number' || !Number.isFinite(productInput.currentStock) || productInput.currentStock < 0) {
       return { success: false, error: 'Stock quantity cannot be negative.' };
     }
   }
 
   if (productInput.purchasePrice !== undefined && productInput.purchasePrice !== null) {
-    if (typeof productInput.purchasePrice !== 'number' || isNaN(productInput.purchasePrice) || productInput.purchasePrice < 0) {
+    if (typeof productInput.purchasePrice !== 'number' || !Number.isFinite(productInput.purchasePrice) || productInput.purchasePrice < 0) {
       return { success: false, error: 'Purchase price cannot be negative.' };
     }
   }
 
   const minStockAlert =
-    typeof productInput.minStockAlert === 'number' && !isNaN(productInput.minStockAlert) && productInput.minStockAlert >= 0
+    typeof productInput.minStockAlert === 'number' && !!Number.isFinite(productInput.minStockAlert) && productInput.minStockAlert >= 0
       ? productInput.minStockAlert
       : 5;
 
@@ -800,7 +815,7 @@ export function addProduct(
       ? Number(productInput.purchasePrice.toFixed(2))
       : null;
 
-  const id = `prod-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const id = `prod-${crypto.randomUUID()}`;
   const newProduct: Product = {
     ...productInput,
     id,
@@ -816,7 +831,7 @@ export function addProduct(
   const newStockMovements = [...current.stockMovements];
   if (typeof newProduct.currentStock === 'number') {
     newStockMovements.unshift({
-      id: `mov-${Date.now()}`,
+      id: `mov-${crypto.randomUUID()}`,
       productId: newProduct.id,
       productName: newProduct.name,
       type: 'opening',
@@ -839,7 +854,7 @@ export function addProduct(
     stockMovements: newStockMovements,
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'product_add',
         title: 'Product Added',
         description: `${newProduct.name} - ${stockDesc}`,
@@ -849,7 +864,9 @@ export function addProduct(
     ],
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, product: newProduct };
 }
 
@@ -889,7 +906,7 @@ export function updateProduct(
   let finalSellingPrice = existing.sellingPrice;
   if (updates.sellingPrice !== undefined) {
     if (updates.sellingPrice !== null) {
-      if (typeof updates.sellingPrice !== 'number' || isNaN(updates.sellingPrice) || updates.sellingPrice <= 0) {
+      if (typeof updates.sellingPrice !== 'number' || !Number.isFinite(updates.sellingPrice) || updates.sellingPrice <= 0) {
         return { success: false, error: 'Selling price must be greater than zero.' };
       }
       finalSellingPrice = Number(updates.sellingPrice.toFixed(2));
@@ -902,7 +919,7 @@ export function updateProduct(
   let finalStock = existing.currentStock;
   if (updates.currentStock !== undefined) {
     if (updates.currentStock !== null) {
-      if (typeof updates.currentStock !== 'number' || isNaN(updates.currentStock) || updates.currentStock < 0) {
+      if (typeof updates.currentStock !== 'number' || !Number.isFinite(updates.currentStock) || updates.currentStock < 0) {
         return { success: false, error: 'Stock quantity cannot be negative.' };
       }
       finalStock = roundPrecision(updates.currentStock, 3);
@@ -915,7 +932,7 @@ export function updateProduct(
   let finalPurchasePrice = existing.purchasePrice;
   if (updates.purchasePrice !== undefined) {
     if (updates.purchasePrice !== null) {
-      if (typeof updates.purchasePrice !== 'number' || isNaN(updates.purchasePrice) || updates.purchasePrice < 0) {
+      if (typeof updates.purchasePrice !== 'number' || !Number.isFinite(updates.purchasePrice) || updates.purchasePrice < 0) {
         return { success: false, error: 'Purchase price cannot be negative.' };
       }
       finalPurchasePrice = Number(updates.purchasePrice.toFixed(2));
@@ -927,7 +944,7 @@ export function updateProduct(
   // Validate minStockAlert
   let finalMinStock = existing.minStockAlert;
   if (updates.minStockAlert !== undefined) {
-    if (typeof updates.minStockAlert !== 'number' || isNaN(updates.minStockAlert) || updates.minStockAlert < 0) {
+    if (typeof updates.minStockAlert !== 'number' || !Number.isFinite(updates.minStockAlert) || updates.minStockAlert < 0) {
       return { success: false, error: 'Min stock alert must be zero or positive.' };
     }
     finalMinStock = updates.minStockAlert;
@@ -958,7 +975,7 @@ export function updateProduct(
     const diff = roundPrecision((next ?? 0) - (prev ?? 0), 3);
 
     newStockMovements.unshift({
-      id: `mov-${Date.now()}`,
+      id: `mov-${crypto.randomUUID()}`,
       productId: updatedProduct.id,
       productName: updatedProduct.name,
       type: 'adjustment',
@@ -970,7 +987,7 @@ export function updateProduct(
     });
 
     newActivities.unshift({
-      id: `act-${Date.now()}`,
+      id: `act-${crypto.randomUUID()}`,
       type: 'stock_update',
       title: 'Stock Adjusted',
       description: `${updatedProduct.name}: ${prev ?? '—'} ➔ ${next ?? '—'} (${diff > 0 ? `+${diff}` : diff})`,
@@ -985,7 +1002,9 @@ export function updateProduct(
     activities: newActivities,
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, product: updatedProduct };
 }
 
@@ -999,7 +1018,7 @@ export function deleteProduct(id: string): { success: boolean; error?: string } 
     products: current.products.filter((p) => p.id !== id),
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'product_delete',
         title: 'Product Deleted',
         description: `${prod.name} removed from inventory`,
@@ -1009,7 +1028,9 @@ export function deleteProduct(id: string): { success: boolean; error?: string } 
     ],
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true };
 }
 
@@ -1078,6 +1099,10 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
         sellingPrice: validSellingPrice,
         purchasePrice: validPurchasePrice,
         minStockAlert: validMinStock,
+        barcode: item.barcode || existing.barcode,
+        sku: item.sku || existing.sku,
+        size: item.size || existing.size,
+        color: item.color || existing.color,
         updatedAt: new Date().toISOString(),
       };
 
@@ -1088,7 +1113,7 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
       ) {
         const diff = roundPrecision((validStock ?? 0) - (existing.currentStock ?? 0), 3);
         newStockMovements.unshift({
-          id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          id: `mov-${crypto.randomUUID()}`,
           productId: existing.id,
           productName: existing.name,
           type: 'adjustment',
@@ -1123,7 +1148,7 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
           : 5;
 
       const newProd: Product = {
-        id: `prod-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        id: `prod-${crypto.randomUUID()}`,
         name: rawName,
         brandOrVariant: item.brandOrVariant,
         category: item.category || 'General',
@@ -1132,12 +1157,16 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
         sellingPrice: validSellingPrice,
         purchasePrice: validPurchasePrice,
         minStockAlert: validMinStock,
+        barcode: item.barcode,
+        sku: item.sku,
+        size: item.size,
+        color: item.color,
         updatedAt: new Date().toISOString(),
       };
 
       if (typeof newProd.currentStock === 'number') {
         newStockMovements.unshift({
-          id: `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          id: `mov-${crypto.randomUUID()}`,
           productId: newProd.id,
           productName: newProd.name,
           type: 'opening',
@@ -1157,7 +1186,7 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
 
   if (savedProducts.length > 0) {
     newActivities.unshift({
-      id: `act-${Date.now()}`,
+      id: `act-${crypto.randomUUID()}`,
       type: 'product_add',
       title: 'Inventory Saved',
       description: `${addedCount} new ${addedCount === 1 ? 'product' : 'products'}, ${updatedCount} updated`,
@@ -1172,7 +1201,15 @@ export function saveProductsBatch(items: ParsedProductItem[]): {
     activities: newActivities,
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return {
+      success: false,
+      addedCount: 0,
+      updatedCount: 0,
+      savedProducts: [],
+      error: STORAGE_FAILURE_ERROR_MESSAGE,
+    };
+  }
   return { success: true, addedCount, updatedCount, savedProducts };
 }
 
@@ -1200,7 +1237,7 @@ export function quickAddStock(
 
   const newStockMovements = [
     {
-      id: `mov-${Date.now()}`,
+      id: `mov-${crypto.randomUUID()}`,
       productId: prod.id,
       productName: prod.name,
       type: 'purchase' as const,
@@ -1219,7 +1256,7 @@ export function quickAddStock(
     stockMovements: newStockMovements,
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'stock_add',
         title: 'Stock Received',
         description: `+${addQuantity} ${prod.unit} added to ${prod.name} (New stock: ${newStock} ${prod.unit})`,
@@ -1229,178 +1266,106 @@ export function quickAddStock(
     ],
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, product: updatedProduct };
 }
 
 // ---------------- SALES & BILLING ----------------
 
-export function recordSale(saleInput: {
-  items: SaleItem[];
-  paymentMode: PaymentMode;
-  customerId?: string;
-  notes?: string;
-  upiId?: string;
-  paymentStatus?: 'completed' | 'manually_confirmed';
-}): { success: boolean; sale?: Sale; error?: string } {
+export function recordSale(saleInput: SaleInput): { success: boolean; sale?: Sale; error?: string } {
+  const result = applySale(getStoreData(), saleInput);
+  if (!result.success || !result.data) return result;
+  if (!saveStoreData(result.data)) return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  return { success: true, sale: result.sale };
+}
+
+export function updateSalePaymentStatus(
+  saleIdOrInvoiceOrRef: string,
+  verificationStatus: PaymentVerificationStatus,
+  transactionRef?: string
+): { success: boolean; sale?: Sale; error?: string } {
   const current = getStoreData();
-
-  if (!saleInput.items || saleInput.items.length === 0) {
-    return { success: false, error: 'At least 1 item is required in the bill.' };
-  }
-
-  // 1. Validate each line item
-  for (const item of saleInput.items) {
-    if (typeof item.quantity !== 'number' || isNaN(item.quantity) || !isFinite(item.quantity) || item.quantity <= 0) {
-      return { success: false, error: `Invalid quantity for product "${item.productName}".` };
-    }
-    if (typeof item.unitPrice !== 'number' || isNaN(item.unitPrice) || !isFinite(item.unitPrice) || item.unitPrice < 0) {
-      return { success: false, error: `Invalid price for product "${item.productName}".` };
-    }
-    const prod = current.products.find((p) => p.id === item.productId);
-    if (!prod) {
-      return { success: false, error: `Product not found: ${item.productName}` };
-    }
-  }
-
-  // 2. Aggregate requested quantities by productId to ensure multi-line sales are validated and deducted correctly
-  const requestedQtyByProduct = new Map<string, number>();
-  for (const item of saleInput.items) {
-    const existingQty = requestedQtyByProduct.get(item.productId) || 0;
-    requestedQtyByProduct.set(item.productId, roundPrecision(existingQty + item.quantity, 3));
-  }
-
-  // 3. Validate Stock for all tracked items using aggregated quantity
-  for (const [productId, totalRequested] of requestedQtyByProduct.entries()) {
-    const prod = current.products.find((p) => p.id === productId);
-    if (prod && prod.currentStock !== null && prod.currentStock < totalRequested) {
-      return {
-        success: false,
-        error: `Insufficient stock! Only ${prod.currentStock} ${prod.unit} of ${prod.name} available, but requested sale quantity is ${totalRequested} ${prod.unit}.`,
-      };
-    }
-  }
-
-  // 4. Calculate Total Amount
-  const totalAmount = roundPrecision(
-    saleInput.items.reduce((sum, item) => sum + item.totalPrice, 0),
-    2
+  const index = current.sales.findIndex(
+    (s) =>
+      s.id === saleIdOrInvoiceOrRef ||
+      s.invoiceNo === saleIdOrInvoiceOrRef ||
+      (s.transactionRef && s.transactionRef === saleIdOrInvoiceOrRef)
   );
 
-  // 5. Deduct Stock & Record Stock Movements per product
-  const newStockMovements = [...current.stockMovements];
-  const newProducts = current.products.map((prod) => {
-    const totalDeduction = requestedQtyByProduct.get(prod.id);
-    if (totalDeduction === undefined) return prod;
-
-    const prevStock = prod.currentStock;
-    const nextStock =
-      prevStock !== null
-        ? Math.max(0, roundPrecision(prevStock - totalDeduction, 3))
-        : null;
-
-    if (prevStock !== null) {
-      newStockMovements.unshift({
-        id: `mov-${Date.now()}-${prod.id}`,
-        productId: prod.id,
-        productName: prod.name,
-        type: 'sale',
-        quantity: -totalDeduction,
-        previousStock: prevStock,
-        newStock: nextStock,
-        reason: `Sale (${totalDeduction} ${prod.unit})`,
-        createdAt: new Date().toISOString(),
-      });
-    }
-
-    return {
-      ...prod,
-      currentStock: nextStock,
-      updatedAt: new Date().toISOString(),
-    };
-  });
-
-  // 4. Handle Customer Udhaar if paymentMode is 'udhaar'
-  let customerName: string | undefined;
-  const newCustomers = [...current.customers];
-  const newUdhaarTx = [...current.udhaarTransactions];
-
-  if (saleInput.paymentMode === 'udhaar') {
-    if (!saleInput.customerId) {
-      return { success: false, error: 'Customer selection is required for credit / udhaar sales.' };
-    }
-    const custIndex = newCustomers.findIndex((c) => c.id === saleInput.customerId);
-    if (custIndex === -1) {
-      return { success: false, error: 'Selected customer not found.' };
-    }
-    const existingCust = newCustomers[custIndex];
-    const updatedCust: Customer = {
-      ...existingCust,
-      currentBalance: roundPrecision(existingCust.currentBalance + totalAmount, 2),
-      lastTransactionAt: new Date().toISOString(),
-    };
-    newCustomers[custIndex] = updatedCust;
-    customerName = updatedCust.name;
-
-    newUdhaarTx.unshift({
-      id: `udh-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      customerId: updatedCust.id,
-      type: 'credit_given',
-      amount: roundPrecision(totalAmount, 2),
-      notes: `Bill Sale: ${saleInput.items.map((i) => `${i.productName} (${i.quantity} ${i.unit})`).join(', ')}`,
-      createdAt: new Date().toISOString(),
-    });
+  if (index === -1) {
+    return { success: false, error: 'Sale record not found' };
   }
 
-  // 5. Create Sale
-  const invoiceNo = `DS-${1000 + current.sales.length + 1}`;
-  const paymentStatus =
-    saleInput.paymentStatus ||
-    (saleInput.paymentMode === 'online' ? 'manually_confirmed' : 'completed');
-
-  const newSale: Sale = {
-    id: `sale-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    invoiceNo,
-    items: saleInput.items,
-    totalAmount,
-    paymentMode: saleInput.paymentMode,
-    customerId: saleInput.customerId,
-    customerName,
-    createdAt: new Date().toISOString(),
-    notes: saleInput.notes,
-    upiId: saleInput.paymentMode === 'online' ? saleInput.upiId : undefined,
-    paymentStatus,
+  if (verificationStatus === 'paid') return { success: false, error: 'Provider verification is not configured. A local edit cannot verify payment.' };
+  const existingSale = current.sales[index];
+  const updatedSale: Sale = {
+    ...existingSale,
+    paymentVerificationStatus: verificationStatus,
+    paymentStatus: existingSale.paymentStatus,
+    transactionRef: transactionRef || existingSale.transactionRef,
   };
 
-  const modeText =
-    saleInput.paymentMode === 'cash'
-      ? 'Cash'
-      : saleInput.paymentMode === 'online'
-      ? `UPI / Online (Manual Confirmation - Unverified${saleInput.upiId ? ` • ${saleInput.upiId}` : ''})`
-      : `Credit / Udhaar (${customerName})`;
+  const newSales = [...current.sales];
+  newSales[index] = updatedSale;
+
+  const newActivities = [
+    {
+      id: `act-${crypto.randomUUID()}`,
+      type: 'sale' as const,
+      title: `Payment Updated (${updatedSale.invoiceNo})`,
+      description: `Status: ${verificationStatus}${transactionRef ? ` • Ref: ${transactionRef}` : ''}`,
+      amount: updatedSale.totalAmount,
+      timestamp: new Date().toISOString(),
+    },
+    ...current.activities,
+  ];
 
   const updatedData: DukaanStoreData = {
     ...current,
-    products: newProducts,
-    customers: newCustomers,
-    sales: [newSale, ...current.sales],
-    udhaarTransactions: newUdhaarTx,
-    stockMovements: newStockMovements,
-    activities: [
-      {
-        id: `act-${Date.now()}`,
-        type: 'sale',
-        title: `Sale Recorded (${invoiceNo})`,
-        description: `₹${totalAmount} • ${modeText} • ${saleInput.items.length} items`,
-        amount: totalAmount,
-        timestamp: new Date().toISOString(),
-      },
-      ...current.activities,
-    ],
+    sales: newSales,
+    activities: newActivities,
   };
 
-  saveStoreData(updatedData);
-  return { success: true, sale: newSale };
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
+
+  return { success: true, sale: updatedSale };
+}
+
+export function findProductByBarcodeOrSku(code: string, products?: Product[]): Product | undefined {
+  if (!code || typeof code !== 'string') return undefined;
+  const cleanCode = code.trim().toLowerCase();
+  if (!cleanCode) return undefined;
+  const list = products || getStoreData().products;
+  return list.find((p) => {
+    if (p.barcode && p.barcode.trim().toLowerCase() === cleanCode) return true;
+    if (p.sku && p.sku.trim().toLowerCase() === cleanCode) return true;
+    return false;
+  });
+}
+
+export function generateInternalSku(productName: string, variant?: string, category?: string): string {
+  const cleanPart = (str?: string) =>
+    (str || '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .toUpperCase()
+      .slice(0, 4);
+
+  const prefix = cleanPart(productName) || 'PROD';
+  const varPart = cleanPart(variant);
+  const catPart = cleanPart(category);
+  const randomSuffix = Math.floor(1000 + Math.random() * 9000);
+
+  if (varPart) {
+    return `${prefix}-${varPart}-${randomSuffix}`;
+  }
+  if (catPart) {
+    return `${catPart}-${prefix}-${randomSuffix}`;
+  }
+  return `${prefix}-${randomSuffix}`;
 }
 
 // ---------------- UDHAAR REGISTER CRUD ----------------
@@ -1433,11 +1398,12 @@ export function addCustomer(customerInput: {
   const cleanInitBal = roundPrecision(rawInitBal, 2);
 
   const newCust: Customer = {
-    id: `cust-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    id: `cust-${crypto.randomUUID()}`,
     name: trimmedName,
     phone: customerInput.phone.trim() || '—',
     address: customerInput.address?.trim(),
     currentBalance: cleanInitBal,
+    advanceBalance: 0,
     lastTransactionAt: cleanInitBal > 0 ? new Date().toISOString() : undefined,
     createdAt: new Date().toISOString(),
   };
@@ -1445,7 +1411,7 @@ export function addCustomer(customerInput: {
   const newUdhaarTx = [...current.udhaarTransactions];
   if (newCust.currentBalance > 0) {
     newUdhaarTx.unshift({
-      id: `udh-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      id: `udh-${crypto.randomUUID()}`,
       customerId: newCust.id,
       type: 'credit_given',
       amount: newCust.currentBalance,
@@ -1460,7 +1426,7 @@ export function addCustomer(customerInput: {
     udhaarTransactions: newUdhaarTx,
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: 'product_add',
         title: 'Customer Added',
         description: `${newCust.name} (Balance: ₹${newCust.currentBalance})`,
@@ -1470,7 +1436,9 @@ export function addCustomer(customerInput: {
     ],
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, customer: newCust };
 }
 
@@ -1484,20 +1452,45 @@ export function recordUdhaarTransaction(input: {
   const custIndex = current.customers.findIndex((c) => c.id === input.customerId);
 
   if (custIndex === -1) return { success: false, error: 'Customer not found.' };
-  if (typeof input.amount !== 'number' || isNaN(input.amount) || !isFinite(input.amount) || input.amount <= 0) {
+  if (typeof input.amount !== 'number' || !Number.isFinite(input.amount) || !isFinite(input.amount) || input.amount <= 0) {
     return { success: false, error: 'Valid amount greater than zero is required.' };
   }
 
+  if (!['credit_given','payment_received'].includes(input.type)) return { success: false, error: 'Invalid ledger operation.' };
   const cleanAmount = roundPrecision(input.amount, 2);
   const existingCust = current.customers[custIndex];
-  const newBalance =
-    input.type === 'credit_given'
-      ? roundPrecision(existingCust.currentBalance + cleanAmount, 2)
-      : Math.max(0, roundPrecision(existingCust.currentBalance - cleanAmount, 2));
+  const currentBal = existingCust.currentBalance;
+  const currentAdv = existingCust.advanceBalance ?? 0;
+
+  let newBalance = currentBal;
+  let newAdvance = currentAdv;
+
+  if (input.type === 'credit_given') {
+    if (currentAdv >= cleanAmount) {
+      newAdvance = roundPrecision(currentAdv - cleanAmount, 2);
+    } else if (currentAdv > 0) {
+      const remaining = roundPrecision(cleanAmount - currentAdv, 2);
+      newAdvance = 0;
+      newBalance = roundPrecision(currentBal + remaining, 2);
+    } else {
+      newBalance = roundPrecision(currentBal + cleanAmount, 2);
+    }
+  } else {
+    // payment_received: paying off debt or depositing advance
+    if (cleanAmount <= currentBal) {
+      newBalance = roundPrecision(currentBal - cleanAmount, 2);
+    } else {
+      // Overpayment: completely clears debt, excess goes to advance balance!
+      const excess = roundPrecision(cleanAmount - currentBal, 2);
+      newBalance = 0;
+      newAdvance = roundPrecision(currentAdv + excess, 2);
+    }
+  }
 
   const updatedCust: Customer = {
     ...existingCust,
     currentBalance: newBalance,
+    advanceBalance: newAdvance,
     lastTransactionAt: new Date().toISOString(),
   };
 
@@ -1505,7 +1498,7 @@ export function recordUdhaarTransaction(input: {
   newCustomers[custIndex] = updatedCust;
 
   const newTx: UdhaarTransaction = {
-    id: `udh-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    id: `udh-${crypto.randomUUID()}`,
     customerId: updatedCust.id,
     type: input.type,
     amount: cleanAmount,
@@ -1514,16 +1507,20 @@ export function recordUdhaarTransaction(input: {
   };
 
   const isCredit = input.type === 'credit_given';
+  const balanceDesc = updatedCust.advanceBalance && updatedCust.advanceBalance > 0
+    ? `Balance: ₹${updatedCust.currentBalance} (Advance: ₹${updatedCust.advanceBalance})`
+    : `Balance: ₹${updatedCust.currentBalance}`;
+
   const updatedData: DukaanStoreData = {
     ...current,
     customers: newCustomers,
     udhaarTransactions: [newTx, ...current.udhaarTransactions],
     activities: [
       {
-        id: `act-${Date.now()}`,
+        id: `act-${crypto.randomUUID()}`,
         type: isCredit ? 'udhaar_given' : 'udhaar_received',
         title: isCredit ? 'Credit Given' : 'Payment Received',
-        description: `${updatedCust.name}: ₹${cleanAmount} ${isCredit ? 'credit' : 'payment'} • Balance: ₹${updatedCust.currentBalance}`,
+        description: `${updatedCust.name}: ₹${cleanAmount} ${isCredit ? 'credit' : 'payment'} • ${balanceDesc}`,
         amount: cleanAmount,
         timestamp: new Date().toISOString(),
       },
@@ -1531,7 +1528,9 @@ export function recordUdhaarTransaction(input: {
     ],
   };
 
-  saveStoreData(updatedData);
+  if (!saveStoreData(updatedData)) {
+    return { success: false, error: STORAGE_FAILURE_ERROR_MESSAGE };
+  }
   return { success: true, transaction: newTx };
 }
 
@@ -1542,13 +1541,10 @@ export function calculateDailySales(
   udhaarTx: UdhaarTransaction[] = [],
   targetDate: Date = new Date()
 ): DailySalesSummary {
-  const startOfDay = new Date(targetDate);
-  startOfDay.setHours(0, 0, 0, 0);
-  const startMs = startOfDay.getTime();
-
-  const endOfDay = new Date(targetDate);
-  endOfDay.setHours(23, 59, 59, 999);
-  const endMs = endOfDay.getTime();
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(targetDate);
+  const part = (type:string) => parts.find(p=>p.type===type)!.value;
+  const startMs = Date.parse(part('year')+'-'+part('month')+'-'+part('day')+'T00:00:00+05:30');
+  const endMs = startMs + 86_400_000 - 1;
 
   const todaySales = sales.filter((s) => {
     const t = new Date(s.createdAt).getTime();
@@ -1586,8 +1582,13 @@ export function calculateDailySales(
     2
   );
 
-  // Actual cash in drawer today
-  const totalCashInHandToday = roundPrecision(cashSales + udhaarCollected, 2);
+  const isToday = (value?:string) => { const ms=Date.parse(value||''); return ms>=startMs && ms<=endMs; };
+  const returnsToday = roundPrecision(sales.filter(s=>isToday(s.reversedAt)).reduce((sum,s)=>sum+s.totalAmount,0),2);
+  const refundsRecordedToday = roundPrecision(sales.filter(s=>isToday(s.refundRecordedAt)).reduce((sum,s)=>sum+s.totalAmount,0),2);
+  const refundLiability = roundPrecision(sales.filter(s=>s.reversedAt && !s.refundRecordedAt && s.paymentMode!=='udhaar' && (s.paymentMode==='cash'||s.paymentStatus==='manually_confirmed'||s.paymentVerificationStatus==='paid')).reduce((sum,s)=>sum+s.totalAmount,0),2);
+  const cashRefunds = sales.filter(s=>s.paymentMode==='cash'&&isToday(s.refundRecordedAt)).reduce((sum,s)=>sum+s.totalAmount,0);
+  // Cash receipts less explicitly recorded cash refunds; this is not a physical drawer count.
+  const totalCashInHandToday = roundPrecision(cashSales + udhaarCollected - cashRefunds, 2);
 
   // Product-wise quantities sold
   const quantityMap = new Map<string, { productName: string; unit: UnitType; quantity: number; totalAmount: number }>();
@@ -1610,7 +1611,15 @@ export function calculateDailySales(
     });
   });
 
+  const onlineBy = (test: (s: Sale) => boolean) => roundPrecision(todaySales.filter(s => s.paymentMode === 'online' && test(s)).reduce((sum,s) => sum + s.totalAmount, 0), 2);
+  const manuallyConfirmedOnline = onlineBy(s => s.paymentStatus === 'manually_confirmed' && !['failed','cancelled'].includes(s.paymentVerificationStatus || ''));
+  const pendingOnline = onlineBy(s => s.paymentStatus !== 'manually_confirmed' && (!s.paymentVerificationStatus || ['pending_verification','partially_paid'].includes(s.paymentVerificationStatus)));
+  const failedOnline = onlineBy(s => s.paymentVerificationStatus === 'failed');
+  const cancelledOnline = onlineBy(s => s.paymentVerificationStatus === 'cancelled');
+  const confirmedCollections = roundPrecision(cashSales + udhaarCollected + onlineBy(s => s.paymentVerificationStatus === 'paid' && s.paymentStatus !== 'manually_confirmed'), 2);
   return {
+    returnsToday, refundsRecordedToday, refundLiability, netSales: roundPrecision(grossSales-returnsToday,2),
+    confirmedCollections, manuallyConfirmedOnline, pendingOnline, failedOnline, cancelledOnline,
     grossSales,
     completedSalesCount: todaySales.length,
     cashSales,
@@ -1622,4 +1631,25 @@ export function calculateDailySales(
     cashInDrawer: totalCashInHandToday,
     productQuantitiesSold: Array.from(quantityMap.values()),
   };
+}
+
+/** Explicit recovery imports into a NEW slot; damaged records are never replaced. */
+export function importRecoveredShop(data: DukaanStoreData): { success: boolean; error?: string } {
+  const invalid=validateBackupRecords({shopProfile:data.profile,data,exportedAt:new Date().toISOString()});
+  if(invalid)return {success:false,error:invalid};
+  if (!canWriteLocalStore()) return { success: false, error: 'Close the other counter tab first.' };
+  try {
+    const originals: Record<string,string> = {};
+    for (let i=0;i<localStorage.length;i++) { const key=localStorage.key(i); if (key?.startsWith('dukaan_') && !key.startsWith('dukaan_recovery_')) originals[key]=localStorage.getItem(key)!; }
+    localStorage.setItem('dukaan_recovery_originals_'+crypto.randomUUID(), JSON.stringify(originals));
+    const id = 'profile-recovered-'+crypto.randomUUID();
+    const recovered = { ...data, revision: 0, profile: { ...data.profile, id } };
+    saveProfileDataDirect(id, recovered);
+    let profiles: ShopProfile[] = [];
+    try { const parsed=JSON.parse(localStorage.getItem(PROFILES_INDEX_KEY)||'[]'); if (Array.isArray(parsed)) profiles=parsed.filter(p=>p && typeof p.id==='string'); } catch { /* originals preserved */ }
+    localStorage.setItem(PROFILES_INDEX_KEY, JSON.stringify([...profiles,recovered.profile]));
+    localStorage.setItem(ACTIVE_PROFILE_KEY,id);
+    recoveryError=null; cachedSnapshot=recovered; isInitialized=true; notifySubscribers();
+    return { success:true };
+  } catch { return { success:false,error:STORAGE_FAILURE_ERROR_MESSAGE }; }
 }
