@@ -1,4 +1,5 @@
 # Dukaan Saathi AI
+© 2026 Nitish Pal. All rights reserved. Unauthorized copying, modification, distribution, or commercial use of this project is prohibited without prior written permission.
 
 **A voice-assisted billing and inventory app for Indian grocery stores.** Ring up a sale, check stock by weight or piece, and see how much a customer owes. The local counter supports Hindi and mixed Hindi-English input.
 
